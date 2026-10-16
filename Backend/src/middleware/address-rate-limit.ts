@@ -15,8 +15,12 @@
  *
  * Configuration is driven by two environment variables so operators can tune
  * limits independently of the IP window:
- *   ADDRESS_RATE_LIMIT_WINDOW_MS  (default: 60 000 ms)
- *   ADDRESS_RATE_LIMIT_MAX        (default: 100 requests per window)
+ *   ADDRESS_RATE_LIMIT_WINDOW_MS  (default: 60 000 ms; allowed 1 000 – 86 400 000)
+ *   ADDRESS_RATE_LIMIT_MAX        (default: 100 requests per window; allowed 1 – 1 000 000)
+ *   ADDRESS_RATE_LIMIT_MAX_KEYS   (default: 10 000 tracked addresses; allowed 1 – 1 000 000)
+ *
+ * Invalid values are rejected with an error naming the variable, the value and
+ * the allowed range, rather than silently falling back to a default.
  *
  * 429 responses include:
  *   - `Retry-After` header (seconds until the window resets)
@@ -25,7 +29,12 @@
  */
 
 import { Request, Response, NextFunction, RequestHandler } from "express";
-import rateLimit, { RateLimitRequestHandler } from "express-rate-limit";
+import rateLimit, {
+  ClientRateLimitInfo,
+  Options,
+  RateLimitRequestHandler,
+  Store,
+} from "express-rate-limit";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -37,20 +46,151 @@ const NO_ADDRESS_KEY = "__no_address__";
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
+export const DEFAULT_ADDRESS_RATE_LIMIT_WINDOW_MS = 60_000;
+export const DEFAULT_ADDRESS_RATE_LIMIT_MAX = 100;
+export const DEFAULT_ADDRESS_RATE_LIMIT_MAX_KEYS = 10_000;
+
+export interface AddressRateLimitConfig {
+  windowMs: number;
+  max: number;
+  /** Upper bound on distinct addresses tracked at once. */
+  maxKeys: number;
+}
+
+const LIMIT_BOUNDS = {
+  ADDRESS_RATE_LIMIT_WINDOW_MS: [1_000, 86_400_000],
+  ADDRESS_RATE_LIMIT_MAX: [1, 1_000_000],
+  ADDRESS_RATE_LIMIT_MAX_KEYS: [1, 1_000_000],
+} as const;
+
+function parseBounded(
+  name: keyof typeof LIMIT_BOUNDS,
+  raw: string | undefined,
+  fallback: number
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const [min, max] = LIMIT_BOUNDS[name];
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(
+      `Invalid ${name}="${raw}": expected an integer between ${min} and ${max} (default ${fallback})`
+    );
+  }
+  return value;
+}
+
 /**
- * Current window/max values.  Exposed as module-level variables so tests can
- * call `setAddressRateLimit()` to override them before creating an app instance.
+ * Read and validate the per-address limits from the environment.
+ * Throws an actionable error for any value that is not a whole number in range.
  */
-let addressRateLimitWindowMs = 60_000;
-let addressRateLimitMax = 100;
+export function resolveAddressRateLimitConfig(
+  env: NodeJS.ProcessEnv = process.env
+): AddressRateLimitConfig {
+  return {
+    windowMs: parseBounded(
+      "ADDRESS_RATE_LIMIT_WINDOW_MS",
+      env.ADDRESS_RATE_LIMIT_WINDOW_MS,
+      DEFAULT_ADDRESS_RATE_LIMIT_WINDOW_MS
+    ),
+    max: parseBounded(
+      "ADDRESS_RATE_LIMIT_MAX",
+      env.ADDRESS_RATE_LIMIT_MAX,
+      DEFAULT_ADDRESS_RATE_LIMIT_MAX
+    ),
+    maxKeys: parseBounded(
+      "ADDRESS_RATE_LIMIT_MAX_KEYS",
+      env.ADDRESS_RATE_LIMIT_MAX_KEYS,
+      DEFAULT_ADDRESS_RATE_LIMIT_MAX_KEYS
+    ),
+  };
+}
+
+/** Explicit override set through `setAddressRateLimit()`; wins over the environment. */
+let override: { windowMs: number; max: number } | null = null;
 
 /**
  * Override the address rate-limit parameters.
- * Intended for use in tests only — do not call at runtime.
+ * Intended for use in tests only — do not call at runtime. The values are
+ * validated with the same bounds as the environment variables.
  */
 export function setAddressRateLimit(windowMs: number, max: number): void {
-  addressRateLimitWindowMs = windowMs;
-  addressRateLimitMax = max;
+  const [wMin, wMax] = LIMIT_BOUNDS.ADDRESS_RATE_LIMIT_WINDOW_MS;
+  const [mMin, mMax] = LIMIT_BOUNDS.ADDRESS_RATE_LIMIT_MAX;
+  if (!Number.isInteger(windowMs) || windowMs < wMin || windowMs > wMax) {
+    throw new Error(`Invalid address rate-limit window ${windowMs}: expected ${wMin}–${wMax} ms`);
+  }
+  if (!Number.isInteger(max) || max < mMin || max > mMax) {
+    throw new Error(`Invalid address rate-limit max ${max}: expected ${mMin}–${mMax}`);
+  }
+  override = { windowMs, max };
+}
+
+// ── Bounded bucket store ─────────────────────────────────────────────────
+
+interface Bucket {
+  hits: number;
+  resetTime: number;
+}
+
+/**
+ * In-memory counter store with a hard cap on distinct keys.
+ *
+ * Buckets expire when their window ends, so an address that goes quiet is
+ * dropped instead of living for the life of the process. If a flood of distinct
+ * addresses still pushes the store past `maxKeys`, expired buckets are removed
+ * first and only then the least recently used ones — so an active address keeps
+ * its count while idle ones make room.
+ */
+export class BoundedAddressStore implements Store {
+  private windowMs = DEFAULT_ADDRESS_RATE_LIMIT_WINDOW_MS;
+  /** Map iteration order is insertion order; touching a key re-inserts it, so the first key is the least recently used. */
+  private readonly buckets = new Map<string, Bucket>();
+
+  constructor(
+    private readonly maxKeys: number = DEFAULT_ADDRESS_RATE_LIMIT_MAX_KEYS,
+    private readonly now: () => number = () => Date.now()
+  ) {}
+
+  init(options: Options): void {
+    this.windowMs = options.windowMs;
+  }
+
+  /** Number of addresses currently tracked. */
+  get size(): number {
+    return this.buckets.size;
+  }
+
+  async increment(key: string): Promise<ClientRateLimitInfo> {
+    const t = this.now();
+    let bucket = this.buckets.get(key);
+    if (!bucket || bucket.resetTime <= t) {
+      bucket = { hits: 0, resetTime: t + this.windowMs };
+    }
+    bucket.hits += 1;
+    this.buckets.delete(key);
+    this.buckets.set(key, bucket);
+    if (this.buckets.size > this.maxKeys) this.evict(t);
+    return { totalHits: bucket.hits, resetTime: new Date(bucket.resetTime) };
+  }
+
+  async decrement(key: string): Promise<void> {
+    const bucket = this.buckets.get(key);
+    if (bucket && bucket.hits > 0) bucket.hits -= 1;
+  }
+
+  async resetKey(key: string): Promise<void> {
+    this.buckets.delete(key);
+  }
+
+  private evict(t: number): void {
+    for (const [key, bucket] of this.buckets) {
+      if (bucket.resetTime <= t) this.buckets.delete(key);
+    }
+    for (const key of this.buckets.keys()) {
+      if (this.buckets.size <= this.maxKeys) break;
+      this.buckets.delete(key);
+    }
+  }
 }
 
 // ── Address extraction ──────────────────────────────────────────────────────
@@ -110,15 +250,19 @@ export function extractAddress(req: Request): string {
 
 /**
  * Build a fresh `express-rate-limit` instance using the current
- * `addressRateLimitWindowMs` / `addressRateLimitMax` values.
+ * configured window and max values.
  *
  * A new instance must be created each time `createAddressRateLimiter()` is
  * called so that test overrides via `setAddressRateLimit()` take effect.
  */
 export function createAddressRateLimiter(): RateLimitRequestHandler {
+  const config = resolveAddressRateLimitConfig();
+  const windowMs = override?.windowMs ?? config.windowMs;
+  const max = override?.max ?? config.max;
   return rateLimit({
-    windowMs: addressRateLimitWindowMs,
-    max: addressRateLimitMax,
+    windowMs,
+    max,
+    store: new BoundedAddressStore(config.maxKeys),
 
     // Key every counter bucket on the resolved Stellar address.
     keyGenerator: (req: Request) => extractAddress(req),
