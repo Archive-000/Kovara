@@ -149,6 +149,21 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Retry classification (issue #961)
+
+`classifyFailure` in `Backend/src/retry.ts` decides whether an error is worth
+retrying. It is checked in this order:
+
+| Signal | Retried (transient) | Not retried (permanent) |
+| --- | --- | --- |
+| Error `code` | Retryable SQLSTATEs (`40001`, `40P01`, `08xxx`, `53xxx`, `57P0x`, ...) and socket codes (`ECONNRESET`, `ETIMEDOUT`, ...) | Integrity class `23xxx`, `22P02`, `22007`, `22012` |
+| HTTP status (`status`, `statusCode`, `response.status`) | 408, 425, 429, 500, 502, 503, 504 | Every other 4xx/5xx (400, 401, 403, 404, 409, 422, 501, ...) |
+| Message text | Timeout, connection reset/refused, "temporarily unavailable", rate limit, ... | "malformed", "invalid", "constraint", "unauthorized", "not found", ... (checked first) |
+| Anything else | | Unclassified errors are permanent |
+
+A permanent failure fails on the first attempt without any backoff and is routed
+to the dead-letter path with the classification reason in the log.
+
 ## 6. Observability
 
 - **Logging** (`Backend/src/logger.ts`) — `StructuredLogger` writes one JSON line

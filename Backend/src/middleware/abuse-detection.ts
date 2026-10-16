@@ -84,6 +84,11 @@ export interface AbuseConfig {
   baseCooldownMs: number;
   /** Ceiling for the escalating cooldown, ms. */
   maxCooldownMs: number;
+  /**
+   * Quiet time after the last offence, ms, after which a client's offence count
+   * resets and its next cooldown starts again from `baseCooldownMs`.
+   */
+  offenseDecayMs: number;
   /** Distinct identities tracked at once. */
   maxIdentities: number;
   /** Requests from a path matching these patterns are scanner traffic. */
@@ -101,6 +106,7 @@ export const DEFAULT_ABUSE_CONFIG: AbuseConfig = {
   scrapingDistinctThreshold: 120,
   baseCooldownMs: 30_000,
   maxCooldownMs: 15 * 60_000,
+  offenseDecayMs: 10 * 60_000,
   maxIdentities: 10_000,
   scannerPathPatterns: [
     /\.\.(\/|\\)/,
@@ -384,13 +390,19 @@ export class AbuseDetector {
           ? "scanner"
           : "burst";
 
+    // Decay first: a client that has been quiet for `offenseDecayMs` since its
+    // last offence starts over, so the escalation reflects sustained abuse
+    // rather than a scattering of incidents over weeks. (The previous offence
+    // time must be read before it is overwritten below.)
+    if (state.lastOffenseAt > 0 && now - state.lastOffenseAt >= this.config.offenseDecayMs) {
+      state.offenseCount = 0;
+    }
+
     const escalated = this.config.baseCooldownMs * Math.pow(2, state.offenseCount);
     const cooldownMs = Math.min(escalated, this.config.maxCooldownMs);
     state.blockedUntil = now + cooldownMs;
     state.lastOffenseAt = now;
-    // Count offences only while they keep coming, so the escalation reflects
-    // sustained abuse rather than a scattering of incidents over weeks.
-    if (now - state.lastOffenseAt < 10 * 60_000) state.offenseCount += 1;
+    state.offenseCount += 1;
 
     this.detections += 1;
     const event: AbuseEvent = {
