@@ -19,8 +19,14 @@ export type TxStatus = "success" | "failed";
 
 /** A raw Stellar event after decoding, with units resolved. */
 export interface NormalizedStellarEvent {
-  /** Stable identity, used as the idempotency key by the ingestion layer. */
+  /** The provider's event id, trimmed but otherwise as delivered. */
   eventId: string;
+  /**
+   * Canonical identity for replay protection: equivalent spellings of the same
+   * provider id (padding, case, surrounding whitespace) map to one value. The
+   * ingestion layer dedupes on this, not on `eventId`.
+   */
+  canonicalId: string;
   /** Contract event name, taken from the first topic. */
   type: string;
   ledger: number;
@@ -114,6 +120,23 @@ export function stroopsToUnits(amountStroops: bigint): string {
   return negative ? `-${body}` : body;
 }
 
+/**
+ * Reduce a provider event id to its canonical form.
+ *
+ * Soroban ids look like `0000012884905984-0000000001` (TOID and event index),
+ * and the same event can be delivered zero-padded or not. Purely numeric
+ * segments therefore lose their leading zeros; any other id is compared
+ * case-insensitively. The result is deterministic and idempotent.
+ */
+export function canonicalizeEventId(rawId: string): string {
+  const trimmed = rawId.trim();
+  const parts = trimmed.split("-");
+  if (parts.every((part) => /^\d+$/.test(part))) {
+    return parts.map((part) => part.replace(/^0+(?=\d)/, "")).join("-");
+  }
+  return trimmed.toLowerCase();
+}
+
 /** Parse a decimal integer string, or return null when it is not one. */
 function parseIntegerString(value: string): bigint | null {
   const trimmed = value.trim();
@@ -192,6 +215,7 @@ export function normalizeStellarEvent(input: unknown): NormalizedStellarEvent {
 
   return {
     eventId,
+    canonicalId: canonicalizeEventId(eventId),
     // The event name is a short symbol ("post_created"), which the indexer's
     // own handlers already use as the dispatch key.
     type: topics[0]?.trim() ?? "",

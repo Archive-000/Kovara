@@ -294,7 +294,7 @@ async function fetchEvents(
  * in place as the authoritative deduplication layer; this is a cheaper
  * first-pass filter that avoids unnecessary round-trips.
  */
-export async function streamEvents(
+async function runStream(
   config: StreamConfig,
   handler: EventHandler,
   signal: AbortSignal
@@ -547,16 +547,64 @@ export async function streamEvents(
       logger.error("Error fetching events:", err);
     }
 
+    // The abort listener is removed once the wait ends, so a long-running
+    // stream does not accumulate one stale listener per poll.
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, backoffMs);
-      signal.addEventListener("abort", () => {
+      const onAbort = (): void => {
         clearTimeout(timer);
         resolve();
-      });
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, backoffMs);
+      signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
   console.log("[stream] Stopped.");
+}
+
+/** Live subscriptions, one per RPC endpoint and contract. */
+const activeStreams = new Map<string, { controller: AbortController; done: Promise<void> }>();
+
+/**
+ * Subscribe to contract events (BE-52).
+ *
+ * Only one subscription per RPC endpoint and contract can deliver at a time. If
+ * a stream for the same key is still running — for example a reconnect started
+ * before the old loop noticed it was dead — the stale one is aborted and fully
+ * stopped before the new one starts, so each event reaches the consumer once.
+ */
+export async function streamEvents(
+  config: StreamConfig,
+  handler: EventHandler,
+  signal: AbortSignal
+): Promise<void> {
+  const key = `${config.rpcUrl}|${config.contractId}`;
+
+  let previous = activeStreams.get(key);
+  while (previous) {
+    logger.warn("stream_subscription_replaced", { contractId: config.contractId });
+    previous.controller.abort();
+    await previous.done.catch(() => undefined);
+    previous = activeStreams.get(key);
+  }
+
+  const controller = new AbortController();
+  const onAbort = (): void => controller.abort();
+  if (signal.aborted) controller.abort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+
+  const done = runStream(config, handler, controller.signal);
+  const entry = { controller, done };
+  activeStreams.set(key, entry);
+  try {
+    await done;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (activeStreams.get(key) === entry) activeStreams.delete(key);
+  }
 }
 
 // ---------------------------------------------------------------------------

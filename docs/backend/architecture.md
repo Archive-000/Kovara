@@ -149,6 +149,28 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Canonical event identity (issue #966)
+
+Ingestion dedupes on `canonicalId`, not on the provider's raw `eventId`.
+`canonicalizeEventId` strips surrounding whitespace and, for purely numeric ids
+such as `0000012884905984-0000000001`, the leading zeros of each segment
+(`12884905984-1`); other ids are lower-cased. The same on-chain event delivered
+with a differently padded or cased id is therefore recognised as a duplicate
+during replay, while genuinely different events keep distinct identities. The
+original `eventId` is still carried for logs and storage.
+
+### Event-store retention (issue #968)
+
+`EventStore.purgeExpiredEvents()` deletes one batch of expired events per call.
+Only `processed` rows are eligible, and only if they are older than
+`retentionDays` (default 30) **and** outside the replay window, i.e. more than
+`replayWindowLedgers` (default 10,000) ledgers behind the newest stored event.
+`pending`, `failed` and `dead` rows are never deleted, so unfinished work and
+dead-letter evidence survive, and the replay window keeps recent history
+available for `replayLedgerRange`. Batches (default 1,000 rows) keep locks short;
+repeat the call until it deletes fewer rows than the batch size. Nothing calls
+it automatically yet: schedule it from the operator tooling of your choice.
+
 ## 6. Observability
 
 - **Logging** (`Backend/src/logger.ts`) — `StructuredLogger` writes one JSON line

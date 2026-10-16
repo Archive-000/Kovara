@@ -42,11 +42,14 @@ export interface LedgerEventSource {
 
 /** An event after mapping, ready for the domain handlers. */
 export interface DomainEvent {
-  /**
-   * Idempotency key. Stable for a given on-chain event, so a replay of the same
-   * ledger is recognised as a duplicate rather than processed twice.
-   */
+  /** The provider's event id. */
   eventId: string;
+  /**
+   * Idempotency key. Canonical for a given on-chain event (see
+   * `canonicalizeEventId`), so a replay of the same ledger is recognised as a
+   * duplicate even when the provider spells the id differently.
+   */
+  canonicalId: string;
   /** Internal event name, e.g. `post_created`. */
   type: string;
   ledger: number;
@@ -75,6 +78,36 @@ export interface IngestResult {
   malformed: number;
   /** Ledger the caller should resume from next. */
   nextLedger: number;
+  /** True when the batch cap cut the range short; call again from `nextLedger`. */
+  truncated: boolean;
+  /** Raw payloads left for the next call because of the cap. */
+  deferred: number;
+}
+
+/** Default cap on raw payloads handled per `ingestRange` call. */
+export const DEFAULT_MAX_EVENTS_PER_BATCH = 1_000;
+
+/** Ledger of a raw payload, or Infinity when it has none (so it sorts last). */
+function rawLedger(payload: unknown): number {
+  const ledger = Number((payload as { ledger?: unknown } | null)?.ledger);
+  return Number.isFinite(ledger) ? ledger : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * Cut `raw` to roughly `limit` payloads without splitting a ledger.
+ *
+ * The cursor advances to the highest processed ledger + 1, so a ledger that is
+ * only partly processed would lose its remaining events. Whole ledgers are kept
+ * up to the cap; if the very first ledger alone exceeds it, that ledger is kept
+ * whole so ingestion always makes progress.
+ */
+export function boundBatch(raw: unknown[], limit: number): { batch: unknown[]; deferred: number } {
+  if (raw.length <= limit) return { batch: raw, deferred: 0 };
+  const sorted = [...raw].sort((a, b) => rawLedger(a) - rawLedger(b));
+  const cutLedger = rawLedger(sorted[limit - 1]);
+  let batch = sorted.filter((p) => rawLedger(p) < cutLedger);
+  if (batch.length === 0) batch = sorted.filter((p) => rawLedger(p) <= cutLedger);
+  return { batch, deferred: raw.length - batch.length };
 }
 
 /** A source backed by an injected fetch function, for tests and custom RPCs. */
@@ -131,6 +164,7 @@ export class SeenEventIds {
 export function toDomainEvent(event: NormalizedStellarEvent): DomainEvent {
   return {
     eventId: event.eventId,
+    canonicalId: event.canonicalId,
     type: event.type,
     ledger: event.ledger,
     occurredAt: event.ledgerClosedAt,
@@ -154,7 +188,14 @@ export function toDomainEvent(event: NormalizedStellarEvent): DomainEvent {
 export class LedgerIngestor {
   private readonly seen: SeenEventIds;
 
-  constructor(private readonly source: LedgerEventSource, seenCapacity = 10_000) {
+  constructor(
+    private readonly source: LedgerEventSource,
+    seenCapacity = 10_000,
+    private readonly maxEventsPerBatch = DEFAULT_MAX_EVENTS_PER_BATCH
+  ) {
+    if (!Number.isInteger(maxEventsPerBatch) || maxEventsPerBatch < 1) {
+      throw new Error("LedgerIngestor: maxEventsPerBatch must be a positive integer");
+    }
     this.seen = new SeenEventIds(seenCapacity);
   }
 
@@ -188,7 +229,11 @@ export class LedgerIngestor {
       throw err;
     }
 
-    for (const payload of raw) {
+    // Bound the work done per call. Whatever is cut stays unprocessed and is
+    // picked up again because the cursor only advances past processed ledgers.
+    const bounded = boundBatch(raw, this.maxEventsPerBatch);
+
+    for (const payload of bounded.batch) {
       let normalized: NormalizedStellarEvent;
       try {
         normalized = normalizeStellarEvent(payload);
@@ -212,7 +257,7 @@ export class LedgerIngestor {
         continue;
       }
 
-      if (!this.seen.add(domain.eventId)) {
+      if (!this.seen.add(domain.canonicalId)) {
         duplicates.push(domain);
         continue;
       }
@@ -230,9 +275,18 @@ export class LedgerIngestor {
       rejected: rejected.length,
       malformed,
       nextLedger,
+      deferred: bounded.deferred,
     });
 
-    return { accepted, duplicates, rejected, malformed, nextLedger };
+    return {
+      accepted,
+      duplicates,
+      rejected,
+      malformed,
+      nextLedger,
+      truncated: bounded.deferred > 0,
+      deferred: bounded.deferred,
+    };
   }
 }
 

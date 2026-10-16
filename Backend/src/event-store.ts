@@ -16,6 +16,21 @@ import { Pool } from "pg";
 /** Canonical key under which the latest safe cursor is persisted. */
 export const STREAM_CURSOR_KEY = "latest_cursor";
 
+/** Processed events younger than this are never purged. */
+export const DEFAULT_EVENT_RETENTION_DAYS = 30;
+
+/** Processed events within this many ledgers of the newest event are kept for replay. */
+export const DEFAULT_REPLAY_WINDOW_LEDGERS = 10_000;
+
+/** Rows deleted per purge call, so a large backlog cannot hold long locks. */
+export const DEFAULT_PURGE_BATCH_SIZE = 1_000;
+
+export interface EventRetentionOptions {
+  retentionDays?: number;
+  replayWindowLedgers?: number;
+  batchSize?: number;
+}
+
 export type EventStatus = "pending" | "processed" | "failed" | "dead";
 
 export interface FailedEventRecord {
@@ -121,6 +136,48 @@ export class EventStore {
       `,
       [eventId, error]
     );
+  }
+
+  // ── Retention (BE-51) ──────────────────────────────────────────────────────
+
+  /**
+   * Delete one batch of expired, fully processed events. Returns the number of
+   * rows removed; call repeatedly until it returns less than `batchSize`.
+   *
+   * Only rows that are `processed` are eligible, and only when they are both
+   * older than `retentionDays` and outside the replay window (the newest
+   * `replayWindowLedgers` ledgers). `pending`, `failed` and `dead` rows are
+   * never touched: they are unfinished work or evidence an operator still needs.
+   */
+  async purgeExpiredEvents(options: EventRetentionOptions = {}): Promise<number> {
+    const retentionDays = options.retentionDays ?? DEFAULT_EVENT_RETENTION_DAYS;
+    const replayWindow = options.replayWindowLedgers ?? DEFAULT_REPLAY_WINDOW_LEDGERS;
+    const batchSize = options.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
+    if (!Number.isInteger(retentionDays) || retentionDays < 1) {
+      throw new Error("retentionDays must be a positive integer");
+    }
+    if (!Number.isInteger(replayWindow) || replayWindow < 0) {
+      throw new Error("replayWindowLedgers must be a non-negative integer");
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1) {
+      throw new Error("batchSize must be a positive integer");
+    }
+
+    const result = await this.pool.query(
+      `
+      DELETE FROM events
+      WHERE event_id IN (
+        SELECT event_id FROM events
+        WHERE status = 'processed'
+          AND processed_at < NOW() - ($1 * INTERVAL '1 day')
+          AND ledger < COALESCE((SELECT MAX(ledger) FROM events), 0) - $2
+        ORDER BY processed_at ASC
+        LIMIT $3
+      )
+      `,
+      [retentionDays, replayWindow, batchSize]
+    );
+    return result.rowCount ?? 0;
   }
 
   // ── Dead-letter path and retry (BA-031) ────────────────────────────────────
