@@ -90,3 +90,84 @@ describe("PostgresDatabase.insertPost", () => {
     expect(selectCall).toBe(2);
   });
 });
+
+describe("PostgresDatabase.withTransaction (BE-53)", () => {
+  function setup(failOn?: string, failRollback = false) {
+    const clientQueries: string[] = [];
+    const client = {
+      query: jest.fn(async (sql: string) => {
+        clientQueries.push(sql);
+        if (failOn && sql.includes(failOn)) throw new Error(`failed: ${failOn}`);
+        if (failRollback && sql === "ROLLBACK") throw new Error("rollback failed");
+        return { rowCount: 1, rows: [] };
+      }),
+      release: jest.fn(),
+    };
+    const poolQuery = jest.fn(async (sql: string) => {
+      if (sql.includes("cache_epoch") && sql.includes("SELECT")) return { rows: [{ epoch: "0" }], rowCount: 1 };
+      return { rowCount: 1, rows: [] };
+    });
+    const pool = { query: poolQuery, connect: jest.fn(async () => client) };
+    return { database: new PostgresDatabase(pool as unknown as Pool), client, clientQueries, poolQuery };
+  }
+
+  const twoStepWrite = async (client: { query: (sql: string) => Promise<unknown> }) => {
+    await client.query("INSERT INTO tips (step) VALUES (1)");
+    await client.query("UPDATE posts SET tip_total = tip_total + 1");
+    return "done";
+  };
+
+  it("commits every step together when nothing fails", async () => {
+    const { database, client, clientQueries } = setup();
+
+    await expect(database.withTransaction(twoStepWrite)).resolves.toBe("done");
+
+    expect(clientQueries).toEqual([
+      "BEGIN",
+      "INSERT INTO tips (step) VALUES (1)",
+      "UPDATE posts SET tip_total = tip_total + 1",
+      "COMMIT",
+    ]);
+    expect(client.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it("rolls back the earlier writes when a later step fails", async () => {
+    const { database, client, clientQueries } = setup("UPDATE posts");
+
+    await expect(database.withTransaction(twoStepWrite)).rejects.toThrow("failed: UPDATE posts");
+
+    // The first INSERT ran, so it must be undone, and the commit must never happen.
+    expect(clientQueries).toEqual([
+      "BEGIN",
+      "INSERT INTO tips (step) VALUES (1)",
+      "UPDATE posts SET tip_total = tip_total + 1",
+      "ROLLBACK",
+    ]);
+    expect(clientQueries).not.toContain("COMMIT");
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back when the commit itself fails", async () => {
+    const { database, clientQueries } = setup("COMMIT");
+
+    await expect(database.withTransaction(twoStepWrite)).rejects.toThrow("failed: COMMIT");
+
+    expect(clientQueries[clientQueries.length - 1]).toBe("ROLLBACK");
+  });
+
+  it("does not touch the shared cache epoch when the transaction fails", async () => {
+    const { database, poolQuery } = setup("UPDATE posts");
+
+    await expect(database.withTransaction(twoStepWrite)).rejects.toThrow();
+
+    expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  it("destroys the connection when the rollback fails, and still reports the original error", async () => {
+    const { database, client } = setup("UPDATE posts", true);
+
+    await expect(database.withTransaction(twoStepWrite)).rejects.toThrow("failed: UPDATE posts");
+
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+});

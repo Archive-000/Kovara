@@ -149,6 +149,30 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Database transactions and the activity-feed index (issues #970, #973)
+
+`PostgresDatabase.withTransaction(fn)` runs a multi-step write on one dedicated
+connection: `BEGIN`, the caller's statements, then `COMMIT`. Any failure,
+including a failing `COMMIT`, triggers an explicit `ROLLBACK` and the original
+error is rethrown, so no partial change survives. The client is always released
+(destroyed if the rollback itself fails), and the shared cache epoch is bumped
+only after a successful commit. Statements must use the client handed to `fn`.
+
+The contributor activity feed (`PostgresActivityFeed.list`) unions
+`submissions` (by `submitter`) and `verifications` (by `verifier`), then orders
+by time. Migration `014_activity_feed_indexes.sql` gives each branch an index
+matching its newest-first order, and the indexes `INCLUDE` the other selected
+columns so a page can be answered by an index-only scan. Migrations are
+discovered automatically from `Backend/migrations/*.sql` (there is no separate
+registry), so the file is registered by existing in that directory; its
+`schema_version` row is `014_activity_feed_indexes`. The query plan was not
+measured when this change was made, so confirm it on real data with:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM submissions WHERE submitter = 'G…' ORDER BY submitted_at DESC, id LIMIT 20;
+```
+
 ## 6. Observability
 
 - **Logging** (`Backend/src/logger.ts`) — `StructuredLogger` writes one JSON line
@@ -174,10 +198,10 @@ These are real, observable in the code, and worth knowing before operating the s
   (a stray `while (!signal.aborted) {` at the top of the stream loop), so
   `tsc`/`ts-jest` cannot compile it. The live streaming and replay paths cannot be
   built as committed.
-- **Migration version collisions.** `runMigrations` keys a migration by the text
-  before the first `_`, so files sharing a numeric prefix collapse. In the current
-  tree `007_*` has five files and `008_*` has three; only the first per prefix (in
-  sort order) is applied.
+- **Migration prefix collisions.** `007_*`, `008_*` and `014_*` each have several
+  files. `runMigrations` now records every file by its full name, so none of them
+  is skipped, but they still apply in filename order; see the runbook's
+  Migrations section.
 - **Auth middleware is not applied.** `index.ts` builds a Bearer/`API_SECRET`
   guard when `ENABLE_AUTH_MIDDLEWARE=true` and passes it via `createApp`'s
   `options`, but `createApp` resolves it into a variable and never calls
