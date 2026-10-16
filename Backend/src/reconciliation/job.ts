@@ -104,6 +104,26 @@ export interface ReconciliationStore {
   completeRun(report: ReconciliationReport): Promise<void>;
 }
 
+/** What an operator would do about one discrepancy. Advisory: nothing executes it. */
+export interface PlannedCorrection {
+  countryIso: string;
+  category: string;
+  action: "recompute_aggregate" | "remove_aggregate";
+  reason: DiscrepancyKind;
+}
+
+/** The result of a dry run: findings and planned corrections, with nothing persisted. */
+export interface ReconciliationDryRun {
+  runDate: string;
+  dryRun: true;
+  sourceGroups: number;
+  aggregateGroups: number;
+  matchedGroups: number;
+  discrepancyCount: number;
+  discrepancies: Discrepancy[];
+  plannedCorrections: PlannedCorrection[];
+}
+
 /** Counts summarising a reconciliation, useful for tests and reporting. */
 export interface ReconcileResult {
   discrepancies: Discrepancy[];
@@ -212,6 +232,49 @@ export function reconcile(
     sourceGroups: sourceByKey.size,
     aggregateGroups: aggregateByKey.size,
     matchedGroups,
+  };
+}
+
+/**
+ * Map each discrepancy to the correction an operator would make: a group with
+ * no source is a stale aggregate to remove, every other kind is an aggregate to
+ * recompute from the verified submissions. Order follows the discrepancies.
+ */
+export function planCorrections(discrepancies: Discrepancy[]): PlannedCorrection[] {
+  return discrepancies.map((d) => ({
+    countryIso: d.countryIso,
+    category: d.category,
+    action: d.kind === "missing_source" ? "remove_aggregate" : "recompute_aggregate",
+    reason: d.kind,
+  }));
+}
+
+/**
+ * Report what a reconciliation run would find and fix, without writing.
+ *
+ * The store is narrowed to its two read methods, so this function cannot claim
+ * the day's lease, write discrepancies or complete a run even by mistake: a
+ * dry run leaves no trace and does not consume the day, so the real run still
+ * happens afterwards.
+ */
+export async function dryRunReconciliation(
+  store: Pick<ReconciliationStore, "loadSourceTotals" | "loadAggregateTotals">,
+  runDate: string
+): Promise<ReconciliationDryRun> {
+  const [source, aggregates] = await Promise.all([
+    store.loadSourceTotals(runDate),
+    store.loadAggregateTotals(runDate),
+  ]);
+  const result = reconcile(source, aggregates);
+  return {
+    runDate,
+    dryRun: true,
+    sourceGroups: result.sourceGroups,
+    aggregateGroups: result.aggregateGroups,
+    matchedGroups: result.matchedGroups,
+    discrepancyCount: result.discrepancies.length,
+    discrepancies: result.discrepancies,
+    plannedCorrections: planCorrections(result.discrepancies),
   };
 }
 

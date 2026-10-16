@@ -40,6 +40,12 @@ export interface SubmissionRecord {
 export interface VerificationRecord {
   submissionId: string;
   verifier: string;
+  /**
+   * Position in the recorded history. When every record carries one, the
+   * records are evaluated in `sequence` order whatever order they were passed
+   * in; otherwise the order given is taken to be the recorded order.
+   */
+  sequence?: number;
   /** `approve` | `reject`. */
   verdict: "approve" | "reject";
 }
@@ -137,6 +143,20 @@ function applyBps(amount: bigint, bps: bigint): bigint {
 }
 
 /**
+ * Put verifications into their recorded order.
+ *
+ * "First vote wins" is only deterministic if "first" is well defined, so when
+ * every record has a `sequence` they are sorted by it (ties broken by verifier
+ * address, giving a total order). Without sequences the caller's order is kept.
+ */
+export function orderVerifications(verifications: VerificationRecord[]): VerificationRecord[] {
+  if (!verifications.every((v) => typeof v.sequence === "number")) return verifications;
+  return [...verifications].sort(
+    (a, b) => (a.sequence as number) - (b.sequence as number) || a.verifier.localeCompare(b.verifier)
+  );
+}
+
+/**
  * Deduplicate verifications, keeping the first act per verifier.
  *
  * A verifier who votes approve three times must be paid once. Ordering is
@@ -153,6 +173,7 @@ function applyBps(amount: bigint, bps: bigint): bigint {
 export function dedupeVerifications(
   verifications: VerificationRecord[]
 ): { unique: VerificationRecord[]; duplicates: VerificationRecord[] } {
+  verifications = orderVerifications(verifications);
   const seen = new Set<string>();
   const unique: VerificationRecord[] = [];
   const duplicates: VerificationRecord[] = [];
@@ -190,6 +211,12 @@ function corroborationMultiplier(corroborations: number, rules: RewardRules): bi
   return BPS + (rules.corroborationBonusBps * BigInt(steps)) / 8n;
 }
 
+function sortIgnored(
+  ignored: RewardAssessment["ignoredVerifications"]
+): RewardAssessment["ignoredVerifications"] {
+  return [...ignored].sort((a, b) => a.verifier.localeCompare(b.verifier) || a.reason.localeCompare(b.reason));
+}
+
 /**
  * Evaluate one submission and return every reward it owes.
  *
@@ -208,6 +235,23 @@ function corroborationMultiplier(corroborations: number, rules: RewardRules): bi
  *
  * Self-verification is ignored entirely: an address cannot both create data and
  * certify it, which would let one account farm rewards by self-approving.
+ *
+ * Precedence when conditions overlap (fixed, so the result never depends on
+ * which rule happens to be checked first):
+ *   - Submission state outranks everything: `rejected` and `pending` pay
+ *     nothing, whatever the votes say.
+ *   - Per verification, in this order: duplicate vote (first recorded act
+ *     wins) -> invalid address -> self-verification -> non-approving verdict
+ *     (recorded, unpaid) -> paid. A verification is reported under the first
+ *     rule it hits only.
+ *   - Modifiers compose in a fixed order on the submitter's line: base reward,
+ *     then the corroboration multiplier, then the review hold. A flagged
+ *     submission therefore pays `base * corroboration * pendingReviewBps`, and
+ *     every accrual on it is `pending`.
+ *
+ * The output is canonical: the submitter's line first, then verifier lines
+ * sorted by address, and ignored verifications sorted by verifier, so passing
+ * the same facts in a different order yields an identical assessment.
  */
 export function assessSubmission(
   submission: SubmissionRecord,
@@ -230,14 +274,24 @@ export function assessSubmission(
     for (const verification of relevant) {
       ignored.push({ verifier: verification.verifier, reason: "submission_not_verified" });
     }
-    return { submissionId: submission.submissionId, accruals: [], total: 0n, ignoredVerifications: ignored };
+    return {
+      submissionId: submission.submissionId,
+      accruals: [],
+      total: 0n,
+      ignoredVerifications: sortIgnored(ignored),
+    };
   }
 
   if (submission.status === "pending") {
     for (const verification of relevant) {
       ignored.push({ verifier: verification.verifier, reason: "submission_not_verified" });
     }
-    return { submissionId: submission.submissionId, accruals: [], total: 0n, ignoredVerifications: ignored };
+    return {
+      submissionId: submission.submissionId,
+      accruals: [],
+      total: 0n,
+      ignoredVerifications: sortIgnored(ignored),
+    };
   }
 
   const flagged = submission.flagged === true;
@@ -261,6 +315,7 @@ export function assessSubmission(
     state,
   });
 
+  const verifierAccruals: Accrual[] = [];
   for (const verification of relevant) {
     if (!isValidAddress(verification.verifier)) {
       ignored.push({ verifier: verification.verifier, reason: "invalid_verifier" });
@@ -277,7 +332,7 @@ export function assessSubmission(
       // so a late reject cannot retroactively change a published reward.
       continue;
     }
-    accruals.push({
+    verifierAccruals.push({
       address: verification.verifier,
       submissionId: submission.submissionId,
       amount: rules.verificationReward,
@@ -286,8 +341,11 @@ export function assessSubmission(
     });
   }
 
+  verifierAccruals.sort((a, b) => a.address.localeCompare(b.address));
+  accruals.push(...verifierAccruals);
+
   const total = accruals.reduce((sum, a) => sum + a.amount, 0n);
-  return { submissionId: submission.submissionId, accruals, total, ignoredVerifications: ignored };
+  return { submissionId: submission.submissionId, accruals, total, ignoredVerifications: sortIgnored(ignored) };
 }
 
 /**
