@@ -36,12 +36,12 @@ jobs:
         include:
           - package: web
             os: ubuntu-latest
-            working_directory: packages/web
-            test_command: pnpm test --filter=web -- --ci --coverage
+            working_directory: apps/web
+            test_command: pnpm test --filter=apps-web -- --ci --coverage
           - package: mobile
             os: ubuntu-latest
-            working_directory: packages/mobile
-            test_command: pnpm test --filter=mobile -- --ci --coverage
+            working_directory: apps/mobile
+            test_command: pnpm test --filter=@Kovara/mobile -- --ci --coverage
 
     steps:
       - name: Checkout
