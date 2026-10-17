@@ -7,6 +7,25 @@ const TABLE_NAME = "schema_version";
 /** Advisory lock key — must be a bigint literal for pg_advisory_lock(bigint). */
 const LOCK_KEY = 7_357_192_468;
 
+/** Recorded version for a file: its full name without `.sql`, e.g. `007_event_processing`. */
+export function migrationVersion(file: string): string {
+  return file.replace(/\.sql$/, "");
+}
+
+/**
+ * Whether a migration file is already applied.
+ *
+ * Versions used to be only the numeric prefix (`007`), which made files that
+ * share a prefix indistinguishable: an interrupted run that applied
+ * `007_a.sql` but not `007_b.sql` would skip `007_b.sql` forever. New records
+ * use the full file stem. A bare-prefix record written by an older run still
+ * counts for every file with that prefix, so databases migrated before this
+ * change are not re-migrated.
+ */
+export function isApplied(file: string, applied: ReadonlySet<string>): boolean {
+  return applied.has(migrationVersion(file)) || applied.has(file.split("_")[0]);
+}
+
 interface MigrationRecord {
   version: string;
   name: string;
@@ -33,17 +52,14 @@ export async function runMigrations(pool: Pool): Promise<void> {
         .filter((f) => f.endsWith(".sql"))
         .sort();
 
-      const pending = files.filter((f) => {
-        const version = f.split("_")[0];
-        return !applied.has(version);
-      });
+      const pending = files.filter((f) => !isApplied(f, applied));
 
       if (pending.length === 0) {
         return;
       }
 
       for (const file of pending) {
-        const version = file.split("_")[0];
+        const version = migrationVersion(file);
         const sql = readFileSync(join(MIGRATIONS_DIR, file), "utf-8");
 
         try {
@@ -81,12 +97,10 @@ async function ensureSchemaTable(client: PoolClient): Promise<void> {
 }
 
 async function getAppliedMigrations(client: PoolClient): Promise<Set<string>> {
-  try {
-    const result = await client.query<MigrationRecord>(
-      `SELECT version FROM ${TABLE_NAME} ORDER BY version`
-    );
-    return new Set(result.rows.map((r) => r.version));
-  } catch {
-    return new Set();
-  }
+  // Deliberately not caught: treating a failed read as "nothing applied" would
+  // re-run every migration against a database that already has them.
+  const result = await client.query<MigrationRecord>(
+    `SELECT version FROM ${TABLE_NAME} ORDER BY version`
+  );
+  return new Set(result.rows.map((r) => r.version));
 }

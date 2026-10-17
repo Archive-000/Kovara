@@ -78,6 +78,72 @@ export interface DeadLetterRow {
 /** Default number of attempts after which a failure is dead-lettered. */
 export const DEFAULT_MAX_ATTEMPTS = 3;
 
+/** Longest error summary stored with a dead letter, in characters. */
+export const MAX_ERROR_SUMMARY_LENGTH = 500;
+
+/** Longest stored payload `value`, in characters. */
+export const MAX_STORED_VALUE_LENGTH = 8_192;
+
+/** Most dead letters a single redrive call will touch. */
+export const MAX_REDRIVE_BATCH = 100;
+
+const REDACTED = "[redacted]";
+
+/** JSON keys whose values must never be retained in a dead letter. */
+const SENSITIVE_KEY_RE = /pass(word|phrase)?|secret|token|authorization|api[_-]?key|private[_-]?key|seed|mnemonic|signature|cookie/i;
+
+/** Bounded, single-line summary of an error, safe to persist. */
+export function summarizeError(error: string): string {
+  const oneLine = error
+    .replace(/\s+/g, " ")
+    // key=value / key: value pairs where the key looks sensitive.
+    .replace(/(pass(?:word|phrase)?|secret|token|authorization|api[_-]?key|private[_-]?key|seed|mnemonic)(["']?\s*[:=]\s*)("[^"]*"|'[^']*'|\S+)/gi, `$1$2${REDACTED}`)
+    .trim();
+  return oneLine.length > MAX_ERROR_SUMMARY_LENGTH
+    ? `${oneLine.slice(0, MAX_ERROR_SUMMARY_LENGTH - 1)}…`
+    : oneLine;
+}
+
+function redactSensitiveFields(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(redactSensitiveFields);
+  if (node && typeof node === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+      out[key] = SENSITIVE_KEY_RE.test(key) ? REDACTED : redactSensitiveFields(val);
+    }
+    return out;
+  }
+  return node;
+}
+
+/**
+ * Prepare a raw event value for storage: JSON payloads have sensitive fields
+ * masked, and anything oversized is truncated. Non-JSON values (the usual
+ * bare-integer amounts) pass through untouched apart from the length bound.
+ */
+export function sanitizeStoredValue(value: string): string {
+  let out = value;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed && typeof parsed === "object") out = JSON.stringify(redactSensitiveFields(parsed));
+  } catch {
+    // Not JSON; keep as-is.
+  }
+  return out.length > MAX_STORED_VALUE_LENGTH ? out.slice(0, MAX_STORED_VALUE_LENGTH) : out;
+}
+
+/** Outcome of {@link DeadLetterQueue.requeueBatch}. */
+export interface RedriveResult {
+  /** Keys moved back into the live stream. */
+  requeued: string[];
+  /** Keys with no dead letter on record. */
+  notFound: string[];
+  /** Keys whose requeue threw; they remain dead and can be retried. */
+  failed: { idempotencyKey: string; error: string }[];
+  /** Keys beyond the batch cap, untouched and still dead. */
+  remaining: string[];
+}
+
 /** The persistence surface the queue needs. */
 export interface DeadLetterStore {
   /** Insert (or update) the dead-letter record for an event. */
@@ -171,8 +237,8 @@ export class DeadLetterQueue {
       ledger: context.ledger,
       eventType: context.topic[0] ?? "",
       topic: context.topic,
-      value: context.value,
-      error: context.error,
+      value: sanitizeStoredValue(context.value),
+      error: summarizeError(context.error),
       reason,
       attempts: nextAttempts,
     });
@@ -191,6 +257,31 @@ export class DeadLetterQueue {
     // fresh set of attempts, not a continuation of the exhausted one.
     this.attemptsByKey.delete(idempotencyKey);
     return this.store.requeue(idempotencyKey);
+  }
+
+  /**
+   * Requeue up to `limit` dead letters (capped at {@link MAX_REDRIVE_BATCH}).
+   *
+   * Each key is handled independently: one that throws is reported in `failed`
+   * and does not stop the rest, and keys past the cap are returned in
+   * `remaining` untouched, so a partial failure or an oversized request never
+   * loses a record. Duplicate keys are processed once.
+   */
+  async requeueBatch(idempotencyKeys: string[], limit: number = MAX_REDRIVE_BATCH): Promise<RedriveResult> {
+    const cap = Math.max(0, Math.min(Math.floor(limit) || 0, MAX_REDRIVE_BATCH));
+    const unique = [...new Set(idempotencyKeys)];
+    const batch = unique.slice(0, cap);
+    const result: RedriveResult = { requeued: [], notFound: [], failed: [], remaining: unique.slice(cap) };
+
+    for (const key of batch) {
+      try {
+        if (await this.requeue(key)) result.requeued.push(key);
+        else result.notFound.push(key);
+      } catch (err) {
+        result.failed.push({ idempotencyKey: key, error: summarizeError(err instanceof Error ? err.message : String(err)) });
+      }
+    }
+    return result;
   }
 
   /** Count of dead letters awaiting operator attention. */

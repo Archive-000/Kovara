@@ -52,7 +52,8 @@ with every configuration problem listed if a required value is missing.
 | `REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout → `503 REQUEST_TIMEOUT`. |
 | `ENABLE_RATE_LIMITING` | `true` | Set `false` to disable the `/api` limiter. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `60000` / `100` | Parsed, but not wired to the limiter today (see architecture gaps). |
-| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Applies to `setAddressRateLimit()`; the middleware is not mounted today. |
+| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Per-address window and request cap, applied through `setAddressRateLimit()` at startup; the middleware is not mounted today. Window must be an integer 1000–86400000, max an integer 1–1000000; anything else fails startup naming the variable, value and allowed range. |
+| `ADDRESS_RATE_LIMIT_MAX_KEYS` | `10000` | Cap on distinct addresses tracked at once (integer 1–1000000). Expired buckets are dropped first, then least recently used, so active addresses keep their counts. |
 | `ENABLE_AUTH_MIDDLEWARE` | `false` | Builds a Bearer guard, but it is not applied today (see architecture gaps). |
 | `API_SECRET` | unset | Expected bearer token when the auth middleware is eventually applied. |
 | `EXPERIMENTAL_FEATURES` | `false` | Set `true` to mount the `/pools` routes. |
@@ -89,6 +90,59 @@ so it is logged but does not page), and a later breach starts a new timer.
 
 Invalid values fall back to the defaults. The monitor only alerts when an alert
 sink is configured (see Alerting above).
+### Ingestion batch limit (issue #967)
+
+`LedgerIngestor` handles at most `maxEventsPerBatch` raw events per
+`ingestRange` call (default 1,000, third constructor argument). When a range
+holds more, whole ledgers are processed up to the cap and the rest is deferred:
+the result has `truncated: true`, the number of left-over payloads in `deferred`,
+and `nextLedger` points at the first ledger that was not fully processed, so
+the next call resumes from there with nothing skipped. A single ledger larger
+than the cap is processed whole so ingestion always makes progress. Keep calling
+`ingestRange` from `nextLedger` until `truncated` is `false`.
+
+### Duplicate stream subscriptions (issue #969)
+
+Only one `streamEvents` subscription runs per RPC URL and contract. Starting a
+second one (for example a reconnect that began before the old loop noticed it
+was dead) aborts the old stream, waits for it to stop, and then starts the new
+one; the log line `stream_subscription_replaced` marks this. Each poll's abort
+listener is also removed when the wait ends, so a long-lived stream does not
+accumulate stale listeners. If you see `stream_subscription_replaced` often,
+look for something restarting the stream on a timer.
+### Abuse-detection cooldown decay (issue #959)
+
+A client tripped by the abuse detector is blocked for a cooldown that starts at
+`baseCooldownMs` (30s) and doubles with each repeat offence, up to
+`maxCooldownMs` (15 min). Abuse signals expire: once a client has had no offence
+for `offenseDecayMs` (default 10 minutes, measured from its last offence), its
+offence count resets and the next detection starts again at the base cooldown.
+Offences that keep arriving inside that interval keep escalating. To lift a block
+immediately, use `AbuseDetector.unblock()`, which also clears the offence count.
+
+### Retry backoff cap (issue #960)
+
+Transient failures are retried with exponential backoff: `baseDelayMs` (300ms)
+multiplied by `backoffMultiplier` (2) per failed attempt, never exceeding
+`maxBackoffMs` (60s). With jitter on (the default) each delay is a random value
+below that ceiling, so the cap holds on every attempt. Invalid options (negative,
+`NaN` or infinite delays, a multiplier below 1) fall back to safe values instead
+of producing a zero or unbounded wait. A call that succeeds returns immediately
+and spends no backoff; the delay only applies between failed attempts.
+
+### Tiered rate-limit boundaries (issue #958)
+
+Tiered limits (`search` 30/min and `write` 20/min by default) are counted per
+client and per tier. Behaviour at the edges:
+
+- Exactly `max` requests in a window succeed; request `max + 1` returns
+  `429` with `code: "RATE_LIMIT_TIER_EXCEEDED"`, the `tier`, `retry_after` (the
+  window length in seconds) and an `X-RateLimit-Tier` header. Further requests
+  keep returning `429` until the window ends.
+- Tiers are independent: exhausting `search` does not affect `write`, and
+  untiered reads (profiles, health) are never counted by either tier.
+- Classification follows the operation: any `POST/PUT/PATCH/DELETE` is `write`,
+  even to a search-shaped path such as `POST /search`.
 
 ### Database pool
 
@@ -98,6 +152,16 @@ sink is configured (see Alerting above).
 | `DB_POOL_CONNECTION_TIMEOUT_MS` | `5000` |
 | `DB_POOL_IDLE_TIMEOUT_MS` | `30000` |
 | `DB_STATEMENT_TIMEOUT_MS` (legacy alias `QUERY_TIMEOUT_MS`) | `30000` |
+
+Pool settings are validated at startup (issue #971). A bad value stops the
+process with a `ConfigError` that lists **every** invalid pool setting at once,
+names the variable that was set (including legacy aliases such as
+`DATABASE_POOL_MAX` or `QUERY_TIMEOUT_MS`), the accepted range and the default.
+`DB_POOL_MAX` must be a whole number from 1 to 100; the three timeouts must be a
+whole number of milliseconds from 0 to 600000, where `0` means no connection
+timeout, never closing idle connections, or no statement timeout respectively.
+Empty values fall back to the default; negative, fractional or non-numeric
+values are rejected.
 
 ### Alerting (optional — inert until a sink is set)
 
@@ -194,7 +258,17 @@ probe cannot reach PostgreSQL.
 - Applied automatically at startup by `runMigrations()`, serialised with an
   advisory lock and recorded in `schema_version`.
 - A failing migration file is rolled back and **skipped** with a warning, so
-  startup continues; check logs for `[migrate] Could not apply …`.
+  startup continues; check logs for `[migrate] Could not apply …`. It is retried
+  on the next start.
+- Reruns are safe (issue #972): each file is applied in its own transaction
+  together with its `schema_version` row, so a crash leaves it either fully
+  applied or not applied at all, and the advisory lock stops two instances
+  applying the same file. Files are recorded by full name (for example
+  `007_event_processing`), so an interrupted run that finished only some files
+  with the same numeric prefix applies the rest on restart. A bare-prefix record
+  such as `007` from an older run still counts as applied for every file with
+  that prefix. If `schema_version` cannot be read, startup fails instead of
+  assuming nothing is applied.
 - Apply manually:
 
   ```bash
@@ -203,8 +277,9 @@ probe cannot reach PostgreSQL.
   ```
 
 - Adding a migration: drop a new `NNN_description.sql` into `Backend/migrations/`.
-  **Give each migration a unique numeric prefix** — files sharing a prefix collapse
-  to a single applied version (the current `007_*`/`008_*` groups are affected).
+  Prefer a unique numeric prefix. Files sharing a prefix (the current `007_*`,
+  `008_*` and `014_*` groups) are tracked individually, but they apply in
+  filename order, so order dependent files should have distinct prefixes.
 - Migrations are forward-only: the repo contains no down migrations. Roll back by
   restoring a database backup.
 
@@ -247,6 +322,21 @@ wired to these** today, so retry is done either by replaying the ledger range
 SELECT status, COUNT(*) FROM events GROUP BY status;
 SELECT event_id, ledger, error, attempts FROM events WHERE status = 'failed' ORDER BY ledger DESC LIMIT 50;
 ```
+
+#### Dead-letter context and redrive limits (issues #962, #963)
+
+When an event is dead-lettered, `DeadLetterQueue` stores a bounded, single-line
+error summary (at most 500 characters, with `password`, `token`, `secret`,
+`authorization`, key and seed style values masked) plus the retry metadata: the
+`reason` and the `attempts` count. The raw `value` is kept only after JSON
+fields with sensitive names are masked and the payload is capped at 8192
+characters, so a dead letter stays debuggable without retaining credentials.
+
+`requeueBatch(keys, limit)` redrives dead letters in bounded batches. At most
+`MAX_REDRIVE_BATCH` (100) keys are processed per call; the rest are returned in
+`remaining` untouched and still dead. Each key is handled independently, so one
+failure is reported in `failed` and does not stop the others, and unknown keys
+are reported in `notFound`. Call it again with `remaining` to continue.
 
 ### 6.4 Lost or wrong cursor
 

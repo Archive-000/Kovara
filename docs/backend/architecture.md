@@ -171,6 +171,102 @@ every record has one they are evaluated in that order; otherwise the order
 supplied is taken as the recorded order. Output is canonical (submitter line
 first, then verifier lines by address; ignored votes by verifier), so input
 order never changes the assessment.
+### Database transactions and the activity-feed index (issues #970, #973)
+
+`PostgresDatabase.withTransaction(fn)` runs a multi-step write on one dedicated
+connection: `BEGIN`, the caller's statements, then `COMMIT`. Any failure,
+including a failing `COMMIT`, triggers an explicit `ROLLBACK` and the original
+error is rethrown, so no partial change survives. The client is always released
+(destroyed if the rollback itself fails), and the shared cache epoch is bumped
+only after a successful commit. Statements must use the client handed to `fn`.
+
+The contributor activity feed (`PostgresActivityFeed.list`) unions
+`submissions` (by `submitter`) and `verifications` (by `verifier`), then orders
+by time. Migration `014_activity_feed_indexes.sql` gives each branch an index
+matching its newest-first order, and the indexes `INCLUDE` the other selected
+columns so a page can be answered by an index-only scan. Migrations are
+discovered automatically from `Backend/migrations/*.sql` (there is no separate
+registry), so the file is registered by existing in that directory; its
+`schema_version` row is `014_activity_feed_indexes`. The query plan was not
+measured when this change was made, so confirm it on real data with:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM submissions WHERE submitter = 'G…' ORDER BY submitted_at DESC, id LIMIT 20;
+```
+### Canonical event identity (issue #966)
+
+Ingestion dedupes on `canonicalId`, not on the provider's raw `eventId`.
+`canonicalizeEventId` strips surrounding whitespace and, for purely numeric ids
+such as `0000012884905984-0000000001`, the leading zeros of each segment
+(`12884905984-1`); other ids are lower-cased. The same on-chain event delivered
+with a differently padded or cased id is therefore recognised as a duplicate
+during replay, while genuinely different events keep distinct identities. The
+original `eventId` is still carried for logs and storage.
+
+### Event-store retention (issue #968)
+
+`EventStore.purgeExpiredEvents()` deletes one batch of expired events per call.
+Only `processed` rows are eligible, and only if they are older than
+`retentionDays` (default 30) **and** outside the replay window, i.e. more than
+`replayWindowLedgers` (default 10,000) ledgers behind the newest stored event.
+`pending`, `failed` and `dead` rows are never deleted, so unfinished work and
+dead-letter evidence survive, and the replay window keeps recent history
+available for `replayLedgerRange`. Batches (default 1,000 rows) keep locks short;
+repeat the call until it deletes fewer rows than the batch size. Nothing calls
+it automatically yet: schedule it from the operator tooling of your choice.
+### Ingestion checkpoints and envelope validation (issues #964, #965)
+
+`LedgerIngestor.ingestRange(range, { process })` hands the accepted events of a
+batch to `process`. `nextLedger` is only returned after `process` resolves for
+the whole batch; if it throws, the batch's event ids are removed from the
+seen-set (so the retry does not drop them as duplicates) and the error
+propagates with no `nextLedger`, so the caller cannot checkpoint past
+unprocessed events. Checkpoint persistence itself is the caller's job and must
+happen after `ingestRange` returns.
+
+Before normalization, the ingestor validates the event envelope in strict mode
+(`normalizeStellarEvent(raw, { strict: true })`): a non-empty `contractId`,
+`txHash`, a parseable `ledgerClosedAt`, a first topic that decodes to an event
+name, and a string `value` when one is present. Events failing this check are
+counted as `malformed` and never reach a handler. Lenient mode remains the
+default for other callers.
+### Retry classification (issue #961)
+
+`classifyFailure` in `Backend/src/retry.ts` decides whether an error is worth
+retrying. It is checked in this order:
+
+| Signal | Retried (transient) | Not retried (permanent) |
+| --- | --- | --- |
+| Error `code` | Retryable SQLSTATEs (`40001`, `40P01`, `08xxx`, `53xxx`, `57P0x`, ...) and socket codes (`ECONNRESET`, `ETIMEDOUT`, ...) | Integrity class `23xxx`, `22P02`, `22007`, `22012` |
+| HTTP status (`status`, `statusCode`, `response.status`) | 408, 425, 429, 500, 502, 503, 504 | Every other 4xx/5xx (400, 401, 403, 404, 409, 422, 501, ...) |
+| Message text | Timeout, connection reset/refused, "temporarily unavailable", rate limit, ... | "malformed", "invalid", "constraint", "unauthorized", "not found", ... (checked first) |
+| Anything else | | Unclassified errors are permanent |
+
+A permanent failure fails on the first attempt without any backoff and is routed
+to the dead-letter path with the classification reason in the log.
+### Wallet signature replay protection (issue #955)
+
+When a `NonceRegistry` is supplied, `walletSignatureMiddleware` records each
+proof's nonce after the signature verifies and rejects a second use with
+`401 WALLET_NONCE_REUSED`. Nonces are stored as `<address>:<nonce>` so they are
+scoped to the signing wallet, and expire when the proof's validity window ends.
+A registry that implements `tryAdd` is used for an atomic check-and-set, so two
+concurrent copies of the same proof cannot both pass; `has` + `add` is only a
+fallback. If the registry fails, the request is refused (`503`), never allowed.
+`InMemoryNonceRegistry` is single-replica only; multi-replica deployments need a
+shared registry with the same atomic `tryAdd` semantics.
+
+### Address rate-limit key cardinality (issue #957)
+
+The per-address limiter keys its counters on the Stellar address found in the
+request. Because any well-formed address is a valid key, an attacker could
+otherwise create unbounded buckets. `BoundedAddressStore` keeps at most
+`ADDRESS_RATE_LIMIT_MAX_KEYS` buckets: each expires when its window ends, and if
+the cap is still exceeded, expired buckets are removed first and then the least
+recently used. A bucket that is being used is moved to the most-recent end on
+every hit, so cleanup does not reset the limit of an active address; only idle
+addresses are evicted. The store is per-process and in memory.
 
 ## 6. Observability
 
@@ -197,10 +293,10 @@ These are real, observable in the code, and worth knowing before operating the s
   (a stray `while (!signal.aborted) {` at the top of the stream loop), so
   `tsc`/`ts-jest` cannot compile it. The live streaming and replay paths cannot be
   built as committed.
-- **Migration version collisions.** `runMigrations` keys a migration by the text
-  before the first `_`, so files sharing a numeric prefix collapse. In the current
-  tree `007_*` has five files and `008_*` has three; only the first per prefix (in
-  sort order) is applied.
+- **Migration prefix collisions.** `007_*`, `008_*` and `014_*` each have several
+  files. `runMigrations` now records every file by its full name, so none of them
+  is skipped, but they still apply in filename order; see the runbook's
+  Migrations section.
 - **Auth middleware is not applied.** `index.ts` builds a Bearer/`API_SECRET`
   guard when `ENABLE_AUTH_MIDDLEWARE=true` and passes it via `createApp`'s
   `options`, but `createApp` resolves it into a variable and never calls
