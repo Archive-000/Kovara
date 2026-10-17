@@ -61,6 +61,40 @@ with every configuration problem listed if a required value is missing.
 | `DEBUG_TOKEN` | unset | Required for `GET /api/v1/debug/snapshot`; unset → `503`. |
 | `GIT_COMMIT` / `BUILD_TIME` | `unknown` | Surfaced by `GET /version`. |
 
+### Abuse-detection cooldown decay (issue #959)
+
+A client tripped by the abuse detector is blocked for a cooldown that starts at
+`baseCooldownMs` (30s) and doubles with each repeat offence, up to
+`maxCooldownMs` (15 min). Abuse signals expire: once a client has had no offence
+for `offenseDecayMs` (default 10 minutes, measured from its last offence), its
+offence count resets and the next detection starts again at the base cooldown.
+Offences that keep arriving inside that interval keep escalating. To lift a block
+immediately, use `AbuseDetector.unblock()`, which also clears the offence count.
+
+### Retry backoff cap (issue #960)
+
+Transient failures are retried with exponential backoff: `baseDelayMs` (300ms)
+multiplied by `backoffMultiplier` (2) per failed attempt, never exceeding
+`maxBackoffMs` (60s). With jitter on (the default) each delay is a random value
+below that ceiling, so the cap holds on every attempt. Invalid options (negative,
+`NaN` or infinite delays, a multiplier below 1) fall back to safe values instead
+of producing a zero or unbounded wait. A call that succeeds returns immediately
+and spends no backoff; the delay only applies between failed attempts.
+
+### Tiered rate-limit boundaries (issue #958)
+
+Tiered limits (`search` 30/min and `write` 20/min by default) are counted per
+client and per tier. Behaviour at the edges:
+
+- Exactly `max` requests in a window succeed; request `max + 1` returns
+  `429` with `code: "RATE_LIMIT_TIER_EXCEEDED"`, the `tier`, `retry_after` (the
+  window length in seconds) and an `X-RateLimit-Tier` header. Further requests
+  keep returning `429` until the window ends.
+- Tiers are independent: exhausting `search` does not affect `write`, and
+  untiered reads (profiles, health) are never counted by either tier.
+- Classification follows the operation: any `POST/PUT/PATCH/DELETE` is `write`,
+  even to a search-shaped path such as `POST /search`.
+
 ### Database pool
 
 | Variable | Default |

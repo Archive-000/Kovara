@@ -193,6 +193,25 @@ function errorCode(err: unknown): string | undefined {
   return undefined;
 }
 
+/** Extract an HTTP status from `status`, `statusCode` or `response.status`, if present. */
+function errorStatus(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const e = err as { status?: unknown; statusCode?: unknown; response?: { status?: unknown } };
+  for (const candidate of [e.status, e.statusCode, e.response?.status]) {
+    if (typeof candidate === "number" && Number.isInteger(candidate) && candidate >= 100 && candidate < 600) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * HTTP statuses worth retrying: request timeout, too early, rate limited, and
+ * the gateway/availability 5xx family. Every other 4xx, and 501/505, describe a
+ * request that will fail the same way again.
+ */
+const RETRYABLE_HTTP_STATUSES: ReadonlySet<number> = new Set([408, 425, 429, 500, 502, 503, 504]);
+
 /** Extract a lowercased message from an unknown thrown value. */
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message.toLowerCase();
@@ -213,10 +232,13 @@ function errorMessage(err: unknown): string {
  *   1. An explicit `code` — most precise. A retryable SQLSTATE or syscall code
  *      wins outright; a known-integrity SQLSTATE (`23505`, `23503`, `22P02`, …)
  *      is permanent even if the message reads like a timeout.
- *   2. Permanent message markers, checked before transient ones so that
+ *   2. An HTTP status (`status`, `statusCode` or `response.status`): 408, 425,
+ *      429, 500, 502, 503 and 504 are transient; every other 4xx/5xx is
+ *      permanent.
+ *   3. Permanent message markers, checked before transient ones so that
  *      "invalid payload" is not mistaken for something worth retrying.
- *   3. Transient message markers.
- *   4. Default: permanent. An unrecognised error is not retried, because
+ *   4. Transient message markers.
+ *   5. Default: permanent. An unrecognised error is not retried, because
  *      retrying an error we do not understand cannot fix it and the
  *      dead-letter path exists precisely so a human can look at it.
  */
@@ -240,6 +262,14 @@ export function classifyFailure(err: unknown): FailureClassification {
     if (/^(08|53|54|55|57|58)/.test(code)) {
       return { kind: "transient", reason: `operational_sqlstate_${code}` };
     }
+  }
+
+  // An explicit HTTP status is more reliable than text in the message.
+  const status = errorStatus(err);
+  if (status !== undefined && status >= 400) {
+    return RETRYABLE_HTTP_STATUSES.has(status)
+      ? { kind: "transient", reason: `retryable_http_status_${status}` }
+      : { kind: "permanent", reason: `http_status_${status}` };
   }
 
   const message = errorMessage(err);
@@ -318,7 +348,8 @@ function describe(err: unknown): string {
 /**
  * Compute the delay before attempt `attempt + 1`, given the attempt that just
  * failed. Attempt 1 yields the base delay, and each subsequent failure
- * multiplies it. With jitter the result is scaled into `[0, backoff)`.
+ * multiplies it, never exceeding `maxBackoffMs`. With jitter the result is scaled
+ * into `[0, backoff)`, so the cap holds for every attempt.
  */
 export function computeBackoffMs(
   attempt: number,
@@ -331,7 +362,20 @@ export function computeBackoffMs(
     jitter = true,
   } = opts;
 
-  const backoff = Math.min(maxBackoffMs, baseDelayMs * Math.pow(backoffMultiplier, attempt - 1));
+  // Sanitise inputs so a bad option can never produce NaN/Infinity (which
+  // `setTimeout` treats as "fire immediately") or a delay above the cap.
+  const cap = Number.isFinite(maxBackoffMs) && maxBackoffMs >= 0 ? maxBackoffMs : MAX_BACKOFF_MS;
+  const base = Number.isFinite(baseDelayMs) && baseDelayMs > 0 ? baseDelayMs : 0;
+  const multiplier =
+    Number.isFinite(backoffMultiplier) && backoffMultiplier >= 1
+      ? backoffMultiplier
+      : DEFAULT_BACKOFF_MULTIPLIER;
+
+  // Grow step by step and stop as soon as the cap is reached, so a very large
+  // attempt number cannot overflow `Math.pow` before the cap is applied.
+  let backoff = base;
+  for (let i = 1; i < attempt && backoff < cap; i++) backoff *= multiplier;
+  backoff = Math.min(backoff, cap);
   return jitter ? Math.floor(Math.random() * backoff) : backoff;
 }
 
