@@ -253,6 +253,21 @@ SELECT status, COUNT(*) FROM events GROUP BY status;
 SELECT event_id, ledger, error, attempts FROM events WHERE status = 'failed' ORDER BY ledger DESC LIMIT 50;
 ```
 
+#### Dead-letter context and redrive limits (issues #962, #963)
+
+When an event is dead-lettered, `DeadLetterQueue` stores a bounded, single-line
+error summary (at most 500 characters, with `password`, `token`, `secret`,
+`authorization`, key and seed style values masked) plus the retry metadata: the
+`reason` and the `attempts` count. The raw `value` is kept only after JSON
+fields with sensitive names are masked and the payload is capped at 8192
+characters, so a dead letter stays debuggable without retaining credentials.
+
+`requeueBatch(keys, limit)` redrives dead letters in bounded batches. At most
+`MAX_REDRIVE_BATCH` (100) keys are processed per call; the rest are returned in
+`remaining` untouched and still dead. Each key is handled independently, so one
+failure is reported in `failed` and does not stop the others, and unknown keys
+are reported in `notFound`. Call it again with `remaining` to continue.
+
 ### 6.4 Lost or wrong cursor
 
 The last safe cursor lives in `stream_state` (key/value). If the cursor is wrong,

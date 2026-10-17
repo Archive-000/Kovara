@@ -149,6 +149,22 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Ingestion checkpoints and envelope validation (issues #964, #965)
+
+`LedgerIngestor.ingestRange(range, { process })` hands the accepted events of a
+batch to `process`. `nextLedger` is only returned after `process` resolves for
+the whole batch; if it throws, the batch's event ids are removed from the
+seen-set (so the retry does not drop them as duplicates) and the error
+propagates with no `nextLedger`, so the caller cannot checkpoint past
+unprocessed events. Checkpoint persistence itself is the caller's job and must
+happen after `ingestRange` returns.
+
+Before normalization, the ingestor validates the event envelope in strict mode
+(`normalizeStellarEvent(raw, { strict: true })`): a non-empty `contractId`,
+`txHash`, a parseable `ledgerClosedAt`, a first topic that decodes to an event
+name, and a string `value` when one is present. Events failing this check are
+counted as `malformed` and never reach a handler. Lenient mode remains the
+default for other callers.
 ### Retry classification (issue #961)
 
 `classifyFailure` in `Backend/src/retry.ts` decides whether an error is worth

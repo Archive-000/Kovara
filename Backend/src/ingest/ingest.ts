@@ -64,6 +64,20 @@ export interface DomainEvent {
   amountStroops: bigint | null;
 }
 
+/** Options for {@link LedgerIngestor.ingestRange}. */
+export interface IngestOptions {
+  /**
+   * Durably process the accepted events (persist, run handlers, ...).
+   *
+   * The checkpoint only moves when this resolves: if it throws, the batch's
+   * event ids are forgotten so a retry of the same range reprocesses them, and
+   * the error propagates *without* a result, so there is no `nextLedger` to
+   * checkpoint. The checkpoint therefore advances for the whole batch or not at
+   * all.
+   */
+  process?: (accepted: DomainEvent[]) => Promise<void>;
+}
+
 export interface IngestResult {
   /** Events accepted and emitted downstream. */
   accepted: DomainEvent[];
@@ -104,6 +118,11 @@ export class SeenEventIds {
 
   has(id: string): boolean {
     return this.ids.has(id);
+  }
+
+  /** Forget `id`, so the event can be ingested again. Returns false if it was unknown. */
+  delete(id: string): boolean {
+    return this.ids.delete(id);
   }
 
   /** Record `id` as seen. Returns false if it was already present. */
@@ -170,8 +189,12 @@ export class LedgerIngestor {
    * If a source under-delivers, advancing to the requested end would skip the
    * gap permanently on the next pass; advancing to what was actually observed
    * re-requests the missing range instead of losing it.
+   *
+   * The cursor is also all-or-nothing per batch: when `options.process` is
+   * given, `nextLedger` is only returned after every accepted event has been
+   * processed, so a failure part-way never lets the checkpoint skip events.
    */
-  async ingestRange(range: LedgerRange): Promise<IngestResult> {
+  async ingestRange(range: LedgerRange, options: IngestOptions = {}): Promise<IngestResult> {
     const accepted: DomainEvent[] = [];
     const duplicates: DomainEvent[] = [];
     const rejected: DomainEvent[] = [];
@@ -191,7 +214,7 @@ export class LedgerIngestor {
     for (const payload of raw) {
       let normalized: NormalizedStellarEvent;
       try {
-        normalized = normalizeStellarEvent(payload);
+        normalized = normalizeStellarEvent(payload, { strict: true });
       } catch {
         malformed += 1;
         continue;
@@ -218,6 +241,23 @@ export class LedgerIngestor {
       }
 
       accepted.push(domain);
+    }
+
+    if (options.process && accepted.length > 0) {
+      try {
+        await options.process(accepted);
+      } catch (err) {
+        // Nothing in this batch is durable, so none of it may count as seen or
+        // the retry would skip it as a duplicate.
+        for (const event of accepted) this.seen.delete(event.eventId);
+        logger.error("ingest_batch_processing_failed", {
+          source: this.source.name,
+          range,
+          accepted: accepted.length,
+          err,
+        });
+        throw err;
+      }
     }
 
     const nextLedger = Math.max(highestLedger + 1, range.startLedger);
