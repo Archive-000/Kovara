@@ -260,3 +260,4 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
 });
+Add deposit precision validation"),
