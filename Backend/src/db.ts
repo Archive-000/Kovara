@@ -12,7 +12,7 @@
  * Idempotent: if the follow already exists the handler returns immediately
  * without issuing a database write.
  */
-import { Pool } from "pg";
+import { Pool, PoolClient } from "pg";
 import {
   DatabasePoolConfig,
   DEFAULT_DB_POOL_CONNECTION_TIMEOUT_MS,
@@ -402,6 +402,42 @@ export class PostgresDatabase implements Database {
 
   private async runQuery(queryText: string, params?: unknown[]) {
     return this.pool.query(queryText, params);
+  }
+
+  /**
+   * Run `fn` as one transaction on a dedicated connection (BE-53).
+   *
+   * Every statement `fn` issues through the supplied client commits together or
+   * not at all: if `fn` (or the commit) throws, the transaction is rolled back
+   * explicitly, so no partial write is left behind, and the original error is
+   * rethrown. The client is always returned to the pool; if the rollback itself
+   * fails the connection is destroyed instead of being reused in an unknown
+   * state. The shared cache epoch is bumped only after a successful commit, so
+   * a failed transaction never invalidates caches or signals other replicas.
+   *
+   * Use the client passed to `fn` for every statement in the unit of work;
+   * queries sent through the pool would run outside the transaction.
+   */
+  async withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    let destroyClient = false;
+    let result!: T;
+    try {
+      await client.query("BEGIN");
+      result = await fn(client);
+      await client.query("COMMIT");
+    } catch (err) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        destroyClient = true;
+      }
+      throw err;
+    } finally {
+      client.release(destroyClient ? true : undefined);
+    }
+    await this.bumpSharedEpoch();
+    return result;
   }
 
   // BA-028: never convert lossy numeric values into bigints silently.

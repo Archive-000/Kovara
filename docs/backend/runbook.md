@@ -124,6 +124,16 @@ client and per tier. Behaviour at the edges:
 | `DB_POOL_IDLE_TIMEOUT_MS` | `30000` |
 | `DB_STATEMENT_TIMEOUT_MS` (legacy alias `QUERY_TIMEOUT_MS`) | `30000` |
 
+Pool settings are validated at startup (issue #971). A bad value stops the
+process with a `ConfigError` that lists **every** invalid pool setting at once,
+names the variable that was set (including legacy aliases such as
+`DATABASE_POOL_MAX` or `QUERY_TIMEOUT_MS`), the accepted range and the default.
+`DB_POOL_MAX` must be a whole number from 1 to 100; the three timeouts must be a
+whole number of milliseconds from 0 to 600000, where `0` means no connection
+timeout, never closing idle connections, or no statement timeout respectively.
+Empty values fall back to the default; negative, fractional or non-numeric
+values are rejected.
+
 ### Alerting (optional — inert until a sink is set)
 
 | Variable | Default |
@@ -219,7 +229,17 @@ probe cannot reach PostgreSQL.
 - Applied automatically at startup by `runMigrations()`, serialised with an
   advisory lock and recorded in `schema_version`.
 - A failing migration file is rolled back and **skipped** with a warning, so
-  startup continues; check logs for `[migrate] Could not apply …`.
+  startup continues; check logs for `[migrate] Could not apply …`. It is retried
+  on the next start.
+- Reruns are safe (issue #972): each file is applied in its own transaction
+  together with its `schema_version` row, so a crash leaves it either fully
+  applied or not applied at all, and the advisory lock stops two instances
+  applying the same file. Files are recorded by full name (for example
+  `007_event_processing`), so an interrupted run that finished only some files
+  with the same numeric prefix applies the rest on restart. A bare-prefix record
+  such as `007` from an older run still counts as applied for every file with
+  that prefix. If `schema_version` cannot be read, startup fails instead of
+  assuming nothing is applied.
 - Apply manually:
 
   ```bash
@@ -228,8 +248,9 @@ probe cannot reach PostgreSQL.
   ```
 
 - Adding a migration: drop a new `NNN_description.sql` into `Backend/migrations/`.
-  **Give each migration a unique numeric prefix** — files sharing a prefix collapse
-  to a single applied version (the current `007_*`/`008_*` groups are affected).
+  Prefer a unique numeric prefix. Files sharing a prefix (the current `007_*`,
+  `008_*` and `014_*` groups) are tracked individually, but they apply in
+  filename order, so order dependent files should have distinct prefixes.
 - Migrations are forward-only: the repo contains no down migrations. Roll back by
   restoring a database backup.
 

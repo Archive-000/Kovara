@@ -292,11 +292,15 @@ function parsePositiveIntEnv(
   const trimmed = raw?.trim() ?? "";
   if (trimmed === "") return defaultValue;
   if (!/^\d+$/.test(trimmed)) {
-    throw new ConfigError([`${name} must be a non-negative integer (milliseconds or count), but was "${raw}"`]);
+    throw new ConfigError([
+      `${name} must be a whole number between ${min} and ${max} (default ${defaultValue}), but was "${raw}"`,
+    ]);
   }
   const parsed = Number(trimmed);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
-    throw new ConfigError([`${name} must be an integer between ${min} and ${max}, but was "${raw}"`]);
+    throw new ConfigError([
+      `${name} must be a whole number between ${min} and ${max} (default ${defaultValue}), but was "${raw}"`,
+    ]);
   }
   return parsed;
 }
@@ -305,44 +309,34 @@ export function parseDbPoolMax(raw: string | undefined): number {
   return parsePositiveIntEnv(raw, "DB_POOL_MAX", DEFAULT_DB_POOL_MAX, { min: 1, max: 100 });
 }
 
-export function parseDbPoolConnectionTimeoutMs(raw: string | undefined): number {
-  // Allow 0 to mean "no timeout" (pg semantics) but default to 5s.
+/**
+ * Parse a millisecond setting in 0–600000. `0` is allowed and keeps its pg
+ * meaning, spelled out in the error so the operator knows what a valid value is.
+ */
+function parseTimeoutMsEnv(raw: string | undefined, name: string, defaultValue: number, zeroMeans: string): number {
   const v = raw?.trim() ?? "";
-  if (v === "") return DEFAULT_DB_POOL_CONNECTION_TIMEOUT_MS;
+  if (v === "") return defaultValue;
+  const hint = `a whole number of milliseconds between 0 and 600000 (0 ${zeroMeans}; default ${defaultValue})`;
   if (!/^\d+$/.test(v)) {
-    throw new ConfigError([`DB_POOL_CONNECTION_TIMEOUT_MS must be a non-negative integer (milliseconds), but was "${raw}"`]);
+    throw new ConfigError([`${name} must be ${hint}, but was "${raw}"`]);
   }
   const n = Number(v);
-  if (!Number.isSafeInteger(n) || n < 0 || n > 600_000) {
-    throw new ConfigError([`DB_POOL_CONNECTION_TIMEOUT_MS must be between 0 and 600000, but was "${raw}"`]);
+  if (!Number.isSafeInteger(n) || n > 600_000) {
+    throw new ConfigError([`${name} must be ${hint}, but was "${raw}"`]);
   }
   return n;
 }
 
-export function parseDbPoolIdleTimeoutMs(raw: string | undefined): number {
-  const v = raw?.trim() ?? "";
-  if (v === "") return DEFAULT_DB_POOL_IDLE_TIMEOUT_MS;
-  if (!/^\d+$/.test(v)) {
-    throw new ConfigError([`DB_POOL_IDLE_TIMEOUT_MS must be a non-negative integer (milliseconds), but was "${raw}"`]);
-  }
-  const n = Number(v);
-  if (!Number.isSafeInteger(n) || n < 0 || n > 600_000) {
-    throw new ConfigError([`DB_POOL_IDLE_TIMEOUT_MS must be between 0 and 600000, but was "${raw}"`]);
-  }
-  return n;
+export function parseDbPoolConnectionTimeoutMs(raw: string | undefined, name = "DB_POOL_CONNECTION_TIMEOUT_MS"): number {
+  return parseTimeoutMsEnv(raw, name, DEFAULT_DB_POOL_CONNECTION_TIMEOUT_MS, "waits forever for a connection");
 }
 
-export function parseDbStatementTimeoutMs(raw: string | undefined): number {
-  const v = raw?.trim() ?? "";
-  if (v === "") return DEFAULT_DB_STATEMENT_TIMEOUT_MS;
-  if (!/^\d+$/.test(v)) {
-    throw new ConfigError([`DB_STATEMENT_TIMEOUT_MS must be a non-negative integer (milliseconds), but was "${raw}"`]);
-  }
-  const n = Number(v);
-  if (!Number.isSafeInteger(n) || n < 0 || n > 600_000) {
-    throw new ConfigError([`DB_STATEMENT_TIMEOUT_MS must be between 0 and 600000, but was "${raw}"`]);
-  }
-  return n;
+export function parseDbPoolIdleTimeoutMs(raw: string | undefined, name = "DB_POOL_IDLE_TIMEOUT_MS"): number {
+  return parseTimeoutMsEnv(raw, name, DEFAULT_DB_POOL_IDLE_TIMEOUT_MS, "never closes idle connections");
+}
+
+export function parseDbStatementTimeoutMs(raw: string | undefined, name = "DB_STATEMENT_TIMEOUT_MS"): number {
+  return parseTimeoutMsEnv(raw, name, DEFAULT_DB_STATEMENT_TIMEOUT_MS, "disables the statement timeout");
 }
 
 /**
@@ -351,19 +345,49 @@ export function parseDbStatementTimeoutMs(raw: string | undefined): number {
  * `DB_STATEMENT_TIMEOUT_MS` takes precedence over `QUERY_TIMEOUT_MS`.
  */
 export function parseDatabasePoolConfig(env: EnvSource = process.env): DatabasePoolConfig {
-  const max = parsePositiveIntEnv(env.DB_POOL_MAX ?? env.DATABASE_POOL_MAX, "DB_POOL_MAX", DEFAULT_DB_POOL_MAX, {
-    min: 1,
-    max: 100,
-  });
-  const connectionTimeoutMillis = parseDbPoolConnectionTimeoutMs(
-    env.DB_POOL_CONNECTION_TIMEOUT_MS ?? env.DATABASE_CONNECTION_TIMEOUT_MS
+  // Report every invalid pool setting in one startup failure rather than one
+  // per restart, and name the variable that was actually set (current or alias).
+  const problems: string[] = [];
+  const attempt = (fn: () => number): number => {
+    try {
+      return fn();
+    } catch (err) {
+      if (!(err instanceof ConfigError)) throw err;
+      problems.push(...err.problems);
+      return 0;
+    }
+  };
+  const nameOf = (current: string, legacy: string): string => (env[current] !== undefined ? current : legacy);
+
+  const max = attempt(() =>
+    parsePositiveIntEnv(
+      env.DB_POOL_MAX ?? env.DATABASE_POOL_MAX,
+      nameOf("DB_POOL_MAX", "DATABASE_POOL_MAX"),
+      DEFAULT_DB_POOL_MAX,
+      { min: 1, max: 100 }
+    )
   );
-  const idleTimeoutMillis = parseDbPoolIdleTimeoutMs(
-    env.DB_POOL_IDLE_TIMEOUT_MS ?? env.DATABASE_IDLE_TIMEOUT_MS
+  const connectionTimeoutMillis = attempt(() =>
+    parseDbPoolConnectionTimeoutMs(
+      env.DB_POOL_CONNECTION_TIMEOUT_MS ?? env.DATABASE_CONNECTION_TIMEOUT_MS,
+      nameOf("DB_POOL_CONNECTION_TIMEOUT_MS", "DATABASE_CONNECTION_TIMEOUT_MS")
+    )
+  );
+  const idleTimeoutMillis = attempt(() =>
+    parseDbPoolIdleTimeoutMs(
+      env.DB_POOL_IDLE_TIMEOUT_MS ?? env.DATABASE_IDLE_TIMEOUT_MS,
+      nameOf("DB_POOL_IDLE_TIMEOUT_MS", "DATABASE_IDLE_TIMEOUT_MS")
+    )
   );
   // Statement timeout: prefer DB_STATEMENT_TIMEOUT_MS, fallback to legacy QUERY_TIMEOUT_MS.
-  const statementRaw = env.DB_STATEMENT_TIMEOUT_MS ?? env.QUERY_TIMEOUT_MS;
-  const statementTimeoutMillis = parseDbStatementTimeoutMs(statementRaw);
+  const statementTimeoutMillis = attempt(() =>
+    parseDbStatementTimeoutMs(
+      env.DB_STATEMENT_TIMEOUT_MS ?? env.QUERY_TIMEOUT_MS,
+      nameOf("DB_STATEMENT_TIMEOUT_MS", "QUERY_TIMEOUT_MS")
+    )
+  );
+
+  if (problems.length > 0) throw new ConfigError(problems);
 
   return { max, connectionTimeoutMillis, idleTimeoutMillis, statementTimeoutMillis };
 }
