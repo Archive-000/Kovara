@@ -61,6 +61,26 @@ with every configuration problem listed if a required value is missing.
 | `DEBUG_TOKEN` | unset | Required for `GET /api/v1/debug/snapshot`; unset → `503`. |
 | `GIT_COMMIT` / `BUILD_TIME` | `unknown` | Surfaced by `GET /version`. |
 
+### Ingestion batch limit (issue #967)
+
+`LedgerIngestor` handles at most `maxEventsPerBatch` raw events per
+`ingestRange` call (default 1,000, third constructor argument). When a range
+holds more, whole ledgers are processed up to the cap and the rest is deferred:
+the result has `truncated: true`, the number of left-over payloads in `deferred`,
+and `nextLedger` points at the first ledger that was not fully processed, so
+the next call resumes from there with nothing skipped. A single ledger larger
+than the cap is processed whole so ingestion always makes progress. Keep calling
+`ingestRange` from `nextLedger` until `truncated` is `false`.
+
+### Duplicate stream subscriptions (issue #969)
+
+Only one `streamEvents` subscription runs per RPC URL and contract. Starting a
+second one (for example a reconnect that began before the old loop noticed it
+was dead) aborts the old stream, waits for it to stop, and then starts the new
+one; the log line `stream_subscription_replaced` marks this. Each poll's abort
+listener is also removed when the wait ends, so a long-lived stream does not
+accumulate stale listeners. If you see `stream_subscription_replaced` often,
+look for something restarting the stream on a timer.
 ### Abuse-detection cooldown decay (issue #959)
 
 A client tripped by the abuse detector is blocked for a cooldown that starts at
