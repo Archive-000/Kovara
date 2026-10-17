@@ -40,6 +40,8 @@ export function PoolDepositForm({
   }, [success, onSuccess]);
 
   const handleDeposit = useCallback(async () => {
+    if (pending) return;
+    
     if (!poolId?.trim()) {
       Alert.alert('Validation Error', 'Pool ID is required');
       return;
@@ -65,7 +67,7 @@ export function PoolDepositForm({
       const message = err instanceof Error ? err.message : 'Deposit failed';
       Alert.alert('Error', message);
     }
-  }, [amount, deposit, poolId, token, decimals]);
+  }, [amount, deposit, poolId, token, decimals, pending]);
 
   const handleReset = useCallback(() => {
     reset();
