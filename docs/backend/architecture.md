@@ -149,6 +149,28 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Reward rule precedence (issue #975)
+
+`assessSubmission` is a pure function: the same submission and verifications
+always produce the same rewards, whatever order they arrive in. When rules
+overlap, this is the order they apply:
+
+1. **Submission state first.** A `rejected` or `pending` submission pays
+   nothing and every vote on it is reported as `submission_not_verified`.
+2. **Per verification**, the first matching rule wins and the vote is reported
+   once: duplicate vote (the first recorded act per verifier stands) ->
+   invalid verifier address -> self-verification -> non-approving verdict
+   (recorded, unpaid) -> paid.
+3. **Modifiers on the submitter's line** compose in a fixed order: base reward,
+   then the corroboration multiplier, then the review hold. A flagged
+   submission pays `base x corroboration x pendingReviewBps` and all of its
+   accruals are `pending`.
+
+"First recorded" is made well defined by `VerificationRecord.sequence`: when
+every record has one they are evaluated in that order; otherwise the order
+supplied is taken as the recorded order. Output is canonical (submitter line
+first, then verifier lines by address; ignored votes by verifier), so input
+order never changes the assessment.
 ### Database transactions and the activity-feed index (issues #970, #973)
 
 `PostgresDatabase.withTransaction(fn)` runs a multi-step write on one dedicated

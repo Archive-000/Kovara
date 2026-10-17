@@ -244,3 +244,21 @@ and back off until the database is reachable again.
   in process and there is no leader election, so multiple live indexers are not
   supported as-is (the `events`/`stream_state` unique constraints keep data
   correct, but they do not coordinate the stream).
+
+## Feed ordering and ties (issue #974)
+
+The feed (`rankFeed`, `Backend/src/feed/ranking.ts`) orders entries by score,
+highest first. When two entries have the same score, the fallback is **`id`
+descending**, so the newer post comes first. This is reported back as
+`ranking.tie_break: "id_desc"` on every feed response.
+
+Details that matter when paging:
+
+- Scores are rounded to six decimal places before they are compared, so posts
+  whose scores differ only below that precision count as tied.
+- Posts with no usable score (for example no timestamp in `recent` or
+  `trending` mode) sort after all scored posts, and are ordered among themselves
+  by the same `id` rule.
+- Because `id` is unique, the order is total: identical requests return
+  identical pages, and a client paging with `limit`/`offset` neither repeats nor
+  skips a post unless the underlying data changes between requests.

@@ -23,10 +23,19 @@
  *     and reported back, so "trending" is a defined quantity rather than a
  *     vibe.
  *
- * Every ordering ends with `id` descending. Without a unique trailing key, two
- * entries with the same score can swap between identical requests and a client
- * paging through the feed sees a row twice and misses another.
+ * Tie policy (see {@link FEED_TIE_BREAK}): entries are ordered by score
+ * descending, and entries whose scores match are ordered by `id` descending
+ * (newest post first, since ids only grow). Scores are rounded to six places
+ * *before* comparing, so two posts that differ only below that precision are
+ * also treated as tied. Without a unique trailing key, two entries with the same
+ * score can swap between identical requests and a client paging through the feed
+ * sees a row twice and misses another. Entries without a usable score
+ * (`-Infinity`, e.g. no timestamp) always sort after scored ones and are tied
+ * among themselves by the same `id` rule.
  */
+
+/** The fallback order applied when ranking scores match. Echoed in every response. */
+export const FEED_TIE_BREAK = "id_desc" as const;
 
 /** A post as the feed reads it. */
 export interface FeedCandidate {
@@ -120,6 +129,8 @@ export interface FeedResult {
     weights: FeedWeights;
     trending_window_days: number | null;
     trending_gravity: number | null;
+    /** How entries with equal scores are ordered. */
+    tie_break: typeof FEED_TIE_BREAK;
   };
 }
 
@@ -264,7 +275,7 @@ export function rankFeed(candidates: FeedCandidate[], options: FeedOptions): Fee
 
   const scored = eligible.map((post) => scoreEntry(post, { mode, now, weights, trendingWindowDays }));
 
-  scored.sort(compareEntries(mode));
+  scored.sort(compareEntries());
 
   const page = scored.slice(offset, offset + limit);
 
@@ -279,6 +290,7 @@ export function rankFeed(candidates: FeedCandidate[], options: FeedOptions): Fee
       weights,
       trending_window_days: mode === "trending" ? trendingWindowDays : null,
       trending_gravity: mode === "trending" ? DEFAULT_TRENDING_GRAVITY : null,
+      tie_break: FEED_TIE_BREAK,
     },
   };
 }
@@ -354,7 +366,7 @@ function trendingScore(post: FeedCandidate, now: Date, windowDays: number): numb
  * order is *total* and identical requests return identical pages. For `recent`
  * the score is already `-age`, so this also yields newest-first.
  */
-function compareEntries(mode: FeedMode): (a: FeedEntry, b: FeedEntry) => number {
+function compareEntries(): (a: FeedEntry, b: FeedEntry) => number {
   return (a, b) => {
     if (b.score !== a.score) {
       // `-Infinity` entries sort last regardless of sign conventions.
@@ -363,7 +375,6 @@ function compareEntries(mode: FeedMode): (a: FeedEntry, b: FeedEntry) => number 
       if (!Number.isFinite(b.score)) return -1;
       return b.score - a.score;
     }
-    void mode;
     return compareId(b, a);
   };
 }

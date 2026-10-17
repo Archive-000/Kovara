@@ -144,6 +144,19 @@ export const DEFAULT_ALERTING_CONFIG: AlertingConfig = {
   sinkTimeoutMs: 5_000,
 };
 
+/** Ingestion-lag alert settings (BE-60). */
+export interface LagAlertConfig {
+  /** Lag, in ledgers, above which ingestion counts as behind. */
+  thresholdLedgers: number;
+  /** How long the lag must stay above the threshold before alerting, in ms. */
+  sustainedMs: number;
+}
+
+export const DEFAULT_LAG_ALERT_CONFIG: LagAlertConfig = {
+  thresholdLedgers: 100,
+  sustainedMs: 5 * 60_000,
+};
+
 /** Raw environment values consumed by {@link loadAlertingConfig}. */
 export type AlertingEnv = Record<string, string | undefined>;
 
@@ -211,6 +224,22 @@ export function loadAlertingConfig(env: AlertingEnv = process.env): AlertingConf
       DEFAULT_ALERTING_CONFIG.sinkTimeoutMs,
       100,
       120_000
+    ),
+  };
+}
+
+/**
+ * Read the lag alert settings from `INGESTION_LAG_THRESHOLD_LEDGERS` and
+ * `INGESTION_LAG_SUSTAIN_MS`. Like the other alert settings, out-of-range or
+ * malformed values fall back to the default instead of blocking startup.
+ */
+export function loadLagAlertConfig(env: AlertingEnv = process.env): LagAlertConfig {
+  return {
+    thresholdLedgers: Math.floor(
+      parseNumber(env.INGESTION_LAG_THRESHOLD_LEDGERS, DEFAULT_LAG_ALERT_CONFIG.thresholdLedgers, 1, 10_000_000)
+    ),
+    sustainedMs: Math.floor(
+      parseNumber(env.INGESTION_LAG_SUSTAIN_MS, DEFAULT_LAG_ALERT_CONFIG.sustainedMs, 0, 24 * 60 * 60_000)
     ),
   };
 }
@@ -660,6 +689,70 @@ function fnv1a32(input: string): number {
 
 /** The manager the application uses. Inert until sinks are registered. */
 export const alertManager = new AlertManager();
+
+/** Where the lag monitor currently stands. */
+export type IngestionLagState = "ok" | "breaching" | "alerting";
+
+/**
+ * Alerts when ingestion stays behind the chain for a sustained period (BE-60).
+ *
+ * Call {@link observe} each time the ingested and chain heads are known. A
+ * single spike above the threshold is only `breaching`; the alert fires once
+ * the lag has stayed above it continuously for `sustainedMs`, and fires once
+ * per episode. Dropping back to the threshold or below clears the episode, so a
+ * later breach starts a fresh timer and can alert again.
+ */
+export class IngestionLagMonitor {
+  private breachedSince: number | null = null;
+  private alerted = false;
+
+  constructor(
+    private readonly manager: Pick<AlertManager, "capture">,
+    private readonly config: LagAlertConfig = DEFAULT_LAG_ALERT_CONFIG,
+    private readonly now: NowFn = Date.now
+  ) {}
+
+  /** Lag in ledgers; never negative if the ingested head is momentarily ahead. */
+  static lag(chainHeadLedger: number, ingestedLedger: number): number {
+    return Math.max(0, chainHeadLedger - ingestedLedger);
+  }
+
+  observe(chainHeadLedger: number, ingestedLedger: number): IngestionLagState {
+    const lag = IngestionLagMonitor.lag(chainHeadLedger, ingestedLedger);
+    const t = this.now();
+
+    if (lag <= this.config.thresholdLedgers) {
+      if (this.alerted) {
+        // Recovered; recorded at warning severity so it shows in logs and stats
+        // without paging anyone.
+        this.manager.capture("warning", "ingestion lag recovered", undefined, {
+          lagLedgers: lag,
+          thresholdLedgers: this.config.thresholdLedgers,
+        });
+      }
+      this.breachedSince = null;
+      this.alerted = false;
+      return "ok";
+    }
+
+    if (this.breachedSince === null) this.breachedSince = t;
+    const breachedForMs = t - this.breachedSince;
+
+    if (breachedForMs >= this.config.sustainedMs) {
+      if (!this.alerted) {
+        this.alerted = true;
+        this.manager.capture("error", "ingestion lag exceeded threshold for a sustained period", undefined, {
+          lagLedgers: lag,
+          thresholdLedgers: this.config.thresholdLedgers,
+          breachedForMs,
+          sustainedMs: this.config.sustainedMs,
+        });
+      }
+      return "alerting";
+    }
+    return "breaching";
+  }
+}
 
 /**
  * Key a caller can set on `logger.error` arguments to raise one alert's

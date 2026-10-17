@@ -61,6 +61,35 @@ with every configuration problem listed if a required value is missing.
 | `DEBUG_TOKEN` | unset | Required for `GET /api/v1/debug/snapshot`; unset → `503`. |
 | `GIT_COMMIT` / `BUILD_TIME` | `unknown` | Surfaced by `GET /version`. |
 
+### Reconciliation dry run (issue #976)
+
+`dryRunReconciliation(store, runDate)` reports what a reconciliation would find
+and what an operator would do about it, without changing anything: it reads the
+source and aggregate totals and returns the discrepancies plus
+`plannedCorrections` (`recompute_aggregate` for a missing, mismatched or
+miscounted aggregate, `remove_aggregate` for an aggregate with no source). It
+takes only the two read methods of the store, so it cannot claim the day's
+lease, write discrepancy rows or complete a run, and a dry run does not use up
+the day: the scheduled run still happens afterwards. The planned corrections are
+advisory; the reconciliation job still never repairs data itself.
+
+### Ingestion lag alerting (issue #977)
+
+`IngestionLagMonitor.observe(chainHeadLedger, ingestedLedger)` raises an `error`
+alert when the ingestion lag stays above the threshold for a sustained period.
+A short spike only moves the monitor to `breaching`; the alert fires once the
+lag has been above the threshold continuously for the sustain time, once per
+episode. When the lag returns to the threshold or below, the episode ends, a
+`warning` "recovered" event is recorded (below the default delivery threshold,
+so it is logged but does not page), and a later breach starts a new timer.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `INGESTION_LAG_THRESHOLD_LEDGERS` | `100` | Lag, in ledgers, above which ingestion counts as behind (1–10,000,000). |
+| `INGESTION_LAG_SUSTAIN_MS` | `300000` | How long the lag must stay above the threshold before alerting (0–86,400,000). |
+
+Invalid values fall back to the defaults. The monitor only alerts when an alert
+sink is configured (see Alerting above).
 ### Ingestion batch limit (issue #967)
 
 `LedgerIngestor` handles at most `maxEventsPerBatch` raw events per
