@@ -60,4 +60,55 @@ describe('IndexerClient', () => {
       new IndexerClientError(400, 'Bad Request')
     );
   });
+
+  it('should handle spaces in query parameters', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+
+    await client.request({
+      endpoint: 'search',
+      params: { q: 'hello world', tag: 'foo bar' },
+    });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.test.com/search?q=hello+world&tag=foo+bar',
+      expect.objectContaining({ method: 'GET' })
+    );
+  });
+
+  it('should handle reserved characters in query parameters', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+
+    await client.request({
+      endpoint: 'search',
+      params: { q: 'a&b=c+d', filter: '100%' },
+    });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.test.com/search?q=a%26b%3Dc%2Bd&filter=100%25',
+      expect.objectContaining({ method: 'GET' })
+    );
+  });
+
+  it('should handle repeated keys for array values', async () => {
+    (global.fetch as jest.Mock).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ success: true }),
+    });
+
+    await client.request({
+      endpoint: 'filter',
+      params: { tags: ['crypto', 'defi', 'stellar'] },
+    });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.test.com/filter?tags=crypto&tags=defi&tags=stellar',
+      expect.objectContaining({ method: 'GET' })
+    );
+  });
 });
