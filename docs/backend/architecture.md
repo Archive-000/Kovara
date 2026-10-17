@@ -165,6 +165,42 @@ Before normalization, the ingestor validates the event envelope in strict mode
 name, and a string `value` when one is present. Events failing this check are
 counted as `malformed` and never reach a handler. Lenient mode remains the
 default for other callers.
+### Retry classification (issue #961)
+
+`classifyFailure` in `Backend/src/retry.ts` decides whether an error is worth
+retrying. It is checked in this order:
+
+| Signal | Retried (transient) | Not retried (permanent) |
+| --- | --- | --- |
+| Error `code` | Retryable SQLSTATEs (`40001`, `40P01`, `08xxx`, `53xxx`, `57P0x`, ...) and socket codes (`ECONNRESET`, `ETIMEDOUT`, ...) | Integrity class `23xxx`, `22P02`, `22007`, `22012` |
+| HTTP status (`status`, `statusCode`, `response.status`) | 408, 425, 429, 500, 502, 503, 504 | Every other 4xx/5xx (400, 401, 403, 404, 409, 422, 501, ...) |
+| Message text | Timeout, connection reset/refused, "temporarily unavailable", rate limit, ... | "malformed", "invalid", "constraint", "unauthorized", "not found", ... (checked first) |
+| Anything else | | Unclassified errors are permanent |
+
+A permanent failure fails on the first attempt without any backoff and is routed
+to the dead-letter path with the classification reason in the log.
+### Wallet signature replay protection (issue #955)
+
+When a `NonceRegistry` is supplied, `walletSignatureMiddleware` records each
+proof's nonce after the signature verifies and rejects a second use with
+`401 WALLET_NONCE_REUSED`. Nonces are stored as `<address>:<nonce>` so they are
+scoped to the signing wallet, and expire when the proof's validity window ends.
+A registry that implements `tryAdd` is used for an atomic check-and-set, so two
+concurrent copies of the same proof cannot both pass; `has` + `add` is only a
+fallback. If the registry fails, the request is refused (`503`), never allowed.
+`InMemoryNonceRegistry` is single-replica only; multi-replica deployments need a
+shared registry with the same atomic `tryAdd` semantics.
+
+### Address rate-limit key cardinality (issue #957)
+
+The per-address limiter keys its counters on the Stellar address found in the
+request. Because any well-formed address is a valid key, an attacker could
+otherwise create unbounded buckets. `BoundedAddressStore` keeps at most
+`ADDRESS_RATE_LIMIT_MAX_KEYS` buckets: each expires when its window ends, and if
+the cap is still exceeded, expired buckets are removed first and then the least
+recently used. A bucket that is being used is moved to the most-recent end on
+every hit, so cleanup does not reset the limit of an active address; only idle
+addresses are evicted. The store is per-process and in memory.
 
 ## 6. Observability
 

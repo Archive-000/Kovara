@@ -1,4 +1,14 @@
-import { tierFor, tierForRequest, effectivePath, setTierConfig, getTierConfig, DEFAULT_TIER_CONFIG } from "../middleware/rate-limit-tiers";
+import express from "express";
+import request from "supertest";
+import {
+  tierFor,
+  tierForRequest,
+  effectivePath,
+  setTierConfig,
+  getTierConfig,
+  tieredRateLimits,
+  DEFAULT_TIER_CONFIG,
+} from "../middleware/rate-limit-tiers";
 
 describe("rate limit tiers (#661)", () => {
   afterEach(() => {
@@ -75,6 +85,79 @@ describe("rate limit tiers (#661)", () => {
       const config = getTierConfig();
       expect(config.search).toEqual({ windowMs: 1_000, max: 5 });
       expect(config.write).toEqual(DEFAULT_TIER_CONFIG.write);
+    });
+  });
+  describe("limit boundaries (BE-41)", () => {
+    const silentLog = { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() } as never;
+
+    function appWith(config: Parameters<typeof tieredRateLimits>[0]) {
+      const app = express();
+      app.use(tieredRateLimits({ ...config, log: silentLog }));
+      app.all("*", (_req, res) => {
+        res.json({ ok: true });
+      });
+      return app;
+    }
+
+    it("allows exactly `max` search requests and rejects the next one", async () => {
+      const app = appWith({ config: { search: { windowMs: 60_000, max: 3 } } });
+
+      for (let i = 0; i < 3; i++) {
+        await request(app).get("/api/v1/search").expect(200);
+      }
+      const res = await request(app).get("/api/v1/search");
+      expect(res.status).toBe(429);
+      expect(res.body).toMatchObject({ code: "RATE_LIMIT_TIER_EXCEEDED", tier: "search" });
+      expect(res.headers["x-ratelimit-tier"]).toBe("search");
+    });
+
+    it("keeps rejecting while over the limit and reports the window as retry_after", async () => {
+      const app = appWith({ config: { search: { windowMs: 30_000, max: 1 } } });
+
+      await request(app).get("/api/v1/leaderboard").expect(200);
+      for (let i = 0; i < 3; i++) {
+        const res = await request(app).get("/api/v1/leaderboard");
+        expect(res.status).toBe(429);
+        expect(res.body.retry_after).toBe(30);
+      }
+    });
+
+    it("applies the write budget to mutations independently of search", async () => {
+      const app = appWith({ config: { write: { windowMs: 60_000, max: 2 } } });
+
+      await request(app).post("/api/v1/posts").expect(200);
+      await request(app).post("/api/v1/posts").expect(200);
+      const res = await request(app).post("/api/v1/posts");
+      expect(res.status).toBe(429);
+      expect(res.body.tier).toBe("write");
+    });
+
+    it("does not let an exhausted tier throttle another tier or the default budget", async () => {
+      const app = appWith({
+        config: { search: { windowMs: 60_000, max: 1 }, write: { windowMs: 60_000, max: 1 } },
+      });
+
+      await request(app).get("/api/v1/search").expect(200);
+      await request(app).get("/api/v1/search").expect(429);
+
+      // Search is exhausted, but a write has its own untouched budget...
+      await request(app).post("/api/v1/posts").expect(200);
+      // ...and an untiered read is never counted by either tier.
+      for (let i = 0; i < 5; i++) {
+        await request(app).get("/api/v1/profiles/GABC").expect(200);
+      }
+    });
+
+    it("counts a POST to a search-shaped path against the write tier only", async () => {
+      const app = appWith({
+        config: { search: { windowMs: 60_000, max: 1 }, write: { windowMs: 60_000, max: 2 } },
+      });
+
+      await request(app).post("/api/v1/search").expect(200);
+      await request(app).post("/api/v1/search").expect(200);
+      await request(app).post("/api/v1/search").expect(429);
+      // The search budget was never touched by those writes.
+      await request(app).get("/api/v1/search").expect(200);
     });
   });
 });
