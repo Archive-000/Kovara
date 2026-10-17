@@ -52,13 +52,68 @@ with every configuration problem listed if a required value is missing.
 | `REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout → `503 REQUEST_TIMEOUT`. |
 | `ENABLE_RATE_LIMITING` | `true` | Set `false` to disable the `/api` limiter. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `60000` / `100` | Parsed, but not wired to the limiter today (see architecture gaps). |
-| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Applies to `setAddressRateLimit()`; the middleware is not mounted today. |
+| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Per-address window and request cap, applied through `setAddressRateLimit()` at startup; the middleware is not mounted today. Window must be an integer 1000–86400000, max an integer 1–1000000; anything else fails startup naming the variable, value and allowed range. |
+| `ADDRESS_RATE_LIMIT_MAX_KEYS` | `10000` | Cap on distinct addresses tracked at once (integer 1–1000000). Expired buckets are dropped first, then least recently used, so active addresses keep their counts. |
 | `ENABLE_AUTH_MIDDLEWARE` | `false` | Builds a Bearer guard, but it is not applied today (see architecture gaps). |
 | `API_SECRET` | unset | Expected bearer token when the auth middleware is eventually applied. |
 | `EXPERIMENTAL_FEATURES` | `false` | Set `true` to mount the `/pools` routes. |
 | `ENABLE_EXPERIMENTAL_ROUTES` | `false` | Parsed but unused; does **not** enable pools. |
 | `DEBUG_TOKEN` | unset | Required for `GET /api/v1/debug/snapshot`; unset → `503`. |
 | `GIT_COMMIT` / `BUILD_TIME` | `unknown` | Surfaced by `GET /version`. |
+
+### Ingestion batch limit (issue #967)
+
+`LedgerIngestor` handles at most `maxEventsPerBatch` raw events per
+`ingestRange` call (default 1,000, third constructor argument). When a range
+holds more, whole ledgers are processed up to the cap and the rest is deferred:
+the result has `truncated: true`, the number of left-over payloads in `deferred`,
+and `nextLedger` points at the first ledger that was not fully processed, so
+the next call resumes from there with nothing skipped. A single ledger larger
+than the cap is processed whole so ingestion always makes progress. Keep calling
+`ingestRange` from `nextLedger` until `truncated` is `false`.
+
+### Duplicate stream subscriptions (issue #969)
+
+Only one `streamEvents` subscription runs per RPC URL and contract. Starting a
+second one (for example a reconnect that began before the old loop noticed it
+was dead) aborts the old stream, waits for it to stop, and then starts the new
+one; the log line `stream_subscription_replaced` marks this. Each poll's abort
+listener is also removed when the wait ends, so a long-lived stream does not
+accumulate stale listeners. If you see `stream_subscription_replaced` often,
+look for something restarting the stream on a timer.
+### Abuse-detection cooldown decay (issue #959)
+
+A client tripped by the abuse detector is blocked for a cooldown that starts at
+`baseCooldownMs` (30s) and doubles with each repeat offence, up to
+`maxCooldownMs` (15 min). Abuse signals expire: once a client has had no offence
+for `offenseDecayMs` (default 10 minutes, measured from its last offence), its
+offence count resets and the next detection starts again at the base cooldown.
+Offences that keep arriving inside that interval keep escalating. To lift a block
+immediately, use `AbuseDetector.unblock()`, which also clears the offence count.
+
+### Retry backoff cap (issue #960)
+
+Transient failures are retried with exponential backoff: `baseDelayMs` (300ms)
+multiplied by `backoffMultiplier` (2) per failed attempt, never exceeding
+`maxBackoffMs` (60s). With jitter on (the default) each delay is a random value
+below that ceiling, so the cap holds on every attempt. Invalid options (negative,
+`NaN` or infinite delays, a multiplier below 1) fall back to safe values instead
+of producing a zero or unbounded wait. A call that succeeds returns immediately
+and spends no backoff; the delay only applies between failed attempts.
+
+### Tiered rate-limit boundaries (issue #958)
+
+Tiered limits (`search` 30/min and `write` 20/min by default) are counted per
+client and per tier. Behaviour at the edges:
+
+- Exactly `max` requests in a window succeed; request `max + 1` returns
+  `429` with `code: "RATE_LIMIT_TIER_EXCEEDED"`, the `tier`, `retry_after` (the
+  window length in seconds) and an `X-RateLimit-Tier` header. Further requests
+  keep returning `429` until the window ends.
+- Tiers are independent: exhausting `search` does not affect `write`, and
+  untiered reads (profiles, health) are never counted by either tier.
+- Classification follows the operation: any `POST/PUT/PATCH/DELETE` is `write`,
+  even to a search-shaped path such as `POST /search`.
 
 ### Database pool
 
@@ -238,6 +293,21 @@ wired to these** today, so retry is done either by replaying the ledger range
 SELECT status, COUNT(*) FROM events GROUP BY status;
 SELECT event_id, ledger, error, attempts FROM events WHERE status = 'failed' ORDER BY ledger DESC LIMIT 50;
 ```
+
+#### Dead-letter context and redrive limits (issues #962, #963)
+
+When an event is dead-lettered, `DeadLetterQueue` stores a bounded, single-line
+error summary (at most 500 characters, with `password`, `token`, `secret`,
+`authorization`, key and seed style values masked) plus the retry metadata: the
+`reason` and the `attempts` count. The raw `value` is kept only after JSON
+fields with sensitive names are masked and the payload is capped at 8192
+characters, so a dead letter stays debuggable without retaining credentials.
+
+`requeueBatch(keys, limit)` redrives dead letters in bounded batches. At most
+`MAX_REDRIVE_BATCH` (100) keys are processed per call; the rest are returned in
+`remaining` untouched and still dead. Each key is handled independently, so one
+failure is reported in `failed` and does not stop the others, and unknown keys
+are reported in `notFound`. Call it again with `remaining` to continue.
 
 ### 6.4 Lost or wrong cursor
 
