@@ -52,7 +52,8 @@ with every configuration problem listed if a required value is missing.
 | `REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout → `503 REQUEST_TIMEOUT`. |
 | `ENABLE_RATE_LIMITING` | `true` | Set `false` to disable the `/api` limiter. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | `60000` / `100` | Parsed, but not wired to the limiter today (see architecture gaps). |
-| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Applies to `setAddressRateLimit()`; the middleware is not mounted today. |
+| `ADDRESS_RATE_LIMIT_WINDOW_MS` / `ADDRESS_RATE_LIMIT_MAX` | `60000` / `100` | Per-address window and request cap, applied through `setAddressRateLimit()` at startup; the middleware is not mounted today. Window must be an integer 1000–86400000, max an integer 1–1000000; anything else fails startup naming the variable, value and allowed range. |
+| `ADDRESS_RATE_LIMIT_MAX_KEYS` | `10000` | Cap on distinct addresses tracked at once (integer 1–1000000). Expired buckets are dropped first, then least recently used, so active addresses keep their counts. |
 | `ENABLE_AUTH_MIDDLEWARE` | `false` | Builds a Bearer guard, but it is not applied today (see architecture gaps). |
 | `API_SECRET` | unset | Expected bearer token when the auth middleware is eventually applied. |
 | `EXPERIMENTAL_FEATURES` | `false` | Set `true` to mount the `/pools` routes. |
