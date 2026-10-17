@@ -167,14 +167,53 @@ export function resolveStatus(raw: Record<string, unknown>): TxStatus {
   return "success";
 }
 
+/** Options for {@link normalizeStellarEvent}. */
+export interface NormalizeOptions {
+  /**
+   * Require the full event envelope (contract id, transaction hash, close time
+   * and an event-name topic) and reject the event if any of it is missing.
+   * The ingestion pipeline sets this so an incomplete event never reaches a
+   * handler; the default stays lenient for callers that only need best effort.
+   */
+  strict?: boolean;
+}
+
+function requireString(raw: Record<string, unknown>, field: string, eventId: string): string {
+  const value = raw[field];
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new NormalizationError(`event ${eventId} is missing ${field}`, field);
+  }
+  return value;
+}
+
+/** Throws a `NormalizationError` naming the first required envelope field that is absent or malformed. */
+function validateEnvelope(raw: Record<string, unknown>, eventId: string): void {
+  requireString(raw, "contractId", eventId);
+  requireString(raw, "txHash", eventId);
+  const closedAt = requireString(raw, "ledgerClosedAt", eventId);
+  if (Number.isNaN(Date.parse(closedAt))) {
+    throw new NormalizationError(`event ${eventId} has an invalid ledgerClosedAt`, "ledgerClosedAt");
+  }
+  if (!Array.isArray(raw.topic) || raw.topic.length === 0 || typeof raw.topic[0] !== "string") {
+    throw new NormalizationError(`event ${eventId} is missing its event-name topic`, "topic");
+  }
+  if (raw.value !== undefined && raw.value !== null && typeof raw.value !== "string") {
+    throw new NormalizationError(`event ${eventId} has a non-string value`, "value");
+  }
+}
+
 /**
  * Normalize one raw RPC event into the internal shape.
  *
  * Throws `NormalizationError` only for input that is structurally unusable
- * (missing identity or ledger); everything else degrades to a null field,
- * because a single odd topic should not cost us the event.
+ * (missing identity or ledger; with `strict`, also a missing envelope field);
+ * everything else degrades to a null field, because a single odd topic should
+ * not cost us the event.
  */
-export function normalizeStellarEvent(input: unknown): NormalizedStellarEvent {
+export function normalizeStellarEvent(
+  input: unknown,
+  options: NormalizeOptions = {}
+): NormalizedStellarEvent {
   if (typeof input !== "object" || input === null) {
     throw new NormalizationError("event must be an object", "event");
   }
@@ -190,6 +229,8 @@ export function normalizeStellarEvent(input: unknown): NormalizedStellarEvent {
   if (!Number.isInteger(ledgerNumber) || ledgerNumber < 0) {
     throw new NormalizationError(`event ${eventId} has an invalid ledger`, "ledger");
   }
+
+  if (options.strict) validateEnvelope(raw, eventId);
 
   const rawTopics = Array.isArray(raw.topic) ? raw.topic : [];
   const topics = rawTopics.map((topic) => {
@@ -213,6 +254,12 @@ export function normalizeStellarEvent(input: unknown): NormalizedStellarEvent {
 
   const account = topics.find(isStellarAddress) ?? null;
 
+  // In strict mode the event name must actually decode; an empty `type` would
+  // reach the handler dispatch with nothing to dispatch on.
+  if (options.strict && (topics[0]?.trim() ?? "") === "") {
+    throw new NormalizationError(`event ${eventId} has an undecodable event-name topic`, "topic");
+  }
+
   return {
     eventId,
     canonicalId: canonicalizeEventId(eventId),
@@ -233,11 +280,14 @@ export function normalizeStellarEvent(input: unknown): NormalizedStellarEvent {
 }
 
 /** Normalize a batch, dropping entries that cannot be normalized. */
-export function normalizeStellarEvents(inputs: readonly unknown[]): NormalizedStellarEvent[] {
+export function normalizeStellarEvents(
+  inputs: readonly unknown[],
+  options: NormalizeOptions = {}
+): NormalizedStellarEvent[] {
   const normalized: NormalizedStellarEvent[] = [];
   for (const input of inputs) {
     try {
-      normalized.push(normalizeStellarEvent(input));
+      normalized.push(normalizeStellarEvent(input, options));
     } catch {
       // Skipped deliberately: one malformed payload must not discard the rest
       // of the batch. The caller sees a shorter list and can compare counts.
