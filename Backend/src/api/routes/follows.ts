@@ -67,6 +67,9 @@ export function createFollowsRouter(db: Database): Router {
       const { address, limit, offset, cursor } = parsed.value;
 
       if (cursor) {
+        // Issue #929: cursor-based pagination follows keyset semantics. We return
+        // `next_offset`/`prev_offset` as `null` because the cursor is the opaque
+        // boundary key (the last follower returned), not a numeric page offset.
         const { followers, total } = await db.getFollowersAfter(address, cursor, limit);
         res.json({
           address,
@@ -96,10 +99,6 @@ export function createFollowsRouter(db: Database): Router {
     }
   );
 
-  /**
-   * GET /follows/:address/following
-   * Returns accounts that the given address follows.
-   */
   router.get(
     "/:address/following",
     async (req: Request, res: Response<FollowingResponse | ApiErrorResponse>): Promise<void> => {

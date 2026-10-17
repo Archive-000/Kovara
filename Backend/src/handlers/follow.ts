@@ -27,8 +27,13 @@ export interface TrendEvent {
  * Handle a Follow event.
  *
  * Inserts a directed edge (follower → followee) into the follow graph.
- * Idempotent: if the follow already exists the handler returns immediately
- * without issuing a database write.
+ *
+ * Replayed follow events must be treated as idempotent and must not create
+ * duplicate relationships or inflate follower/following counts (issue #928).
+ * If the relationship already exists, the handler returns immediately without
+ * issuing a write. The database layer also guards against duplicates via the
+ * UNIQUE (follower, followee) constraint, so even if a race occurs, no second
+ * row is written and counts remain unchanged.
  */
 export async function handleFollow(db: Database, event: FollowEvent): Promise<void> {
   if (!event.follower) {
@@ -39,7 +44,10 @@ export async function handleFollow(db: Database, event: FollowEvent): Promise<vo
   }
 
   const existing = await db.getFollow(event.follower, event.followee);
-  if (existing) return;
+  if (existing) {
+    logger.info(`Follow replay for ${event.follower}→${event.followee} is a no-op`);
+    return;
+  }
 
   await db.insertFollow({
     follower: event.follower,

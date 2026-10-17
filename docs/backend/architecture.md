@@ -358,3 +358,17 @@ These are real, observable in the code, and worth knowing before operating the s
   objects and route-level errors return `{ error, code }` without `success`/
   `timestamp`. Only the 404 catch-all and the global error handler use the shared
   helpers.
+
+### Follow pagination cursor behavior (issue #929)
+
+The follows endpoints implement keyset pagination via the `cursor` query
+parameter (an opaque Stellar address). When `cursor` is provided, the router
+calls `db.getFollowersAfter(address, cursor, limit)` or
+`db.getFollowingAfter(address, cursor, limit)`, and the implementation selects
+the next `limit` addresses strictly after `cursor` using lexicographic ordering
+on the address string (`follower > $2` / `followee > $2` with `ORDER BY ...`).
+The `total` remains the global count for the relationship direction. Responses
+set `next_offset` and `prev_offset` to `null` under cursor mode to reflect the
+keyset model (clients advance by re-supplying the last returned address as the
+next cursor). A cursor longer than the configured bound is rejected by
+`parseCursor` as `INVALID_CURSOR`.

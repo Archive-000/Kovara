@@ -291,6 +291,12 @@ describe("handleUnfollow", () => {
   });
 });
 
+// ── Follow creation idempotency (issue #928) ─────────────────────────────────
+
+describe("handleFollow — idempotency and replay safety (issue #928)", () => {
+  function makeStatefulDb() {
+    const relationships = new Set<string>();
+    const key = (follower: string, followee: string): string => `${follower}:${followee}`;
 // ── Repeated-unfollow semantics (issue #931) ─────────────────────────────────
 
 describe("handleUnfollow — repeated deliveries (issue #931)", () => {
@@ -316,6 +322,38 @@ describe("handleUnfollow — repeated deliveries (issue #931)", () => {
       insertFollow: jest.fn(async (follow: { follower: string; followee: string }) => {
         relationships.add(key(follow.follower, follow.followee));
       }),
+      deleteFollow: jest.fn(),
+    } as unknown as jest.Mocked<Database>;
+    return { db, relationships };
+  }
+
+  const FOLLOW: FollowEvent = { follower: "GABC123", followee: "GXYZ789", ledger: 100 };
+
+  it("repeated follow deliveries do not create duplicate relationships", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, FOLLOW);
+    expect(relationships.size).toBe(1);
+    expect(db.insertFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("follow replay leaves follower/following counts unchanged (no new rows)", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    const firstCount = relationships.size;
+    await handleFollow(db, { ...FOLLOW, ledger: 120 });
+    expect(relationships.size).toBe(firstCount);
+    expect(db.insertFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("multiple different follows are recorded independently", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, { follower: "GAAA", followee: "GBBB", ledger: 101 });
+    await handleFollow(db, FOLLOW); // replay
+    expect(relationships.size).toBe(2);
+    expect(db.insertFollow).toHaveBeenCalledTimes(2);
       deleteFollow: jest.fn(async (follower: string, followee: string) => {
         relationships.delete(key(follower, followee));
       }),
