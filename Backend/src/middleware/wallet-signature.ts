@@ -274,12 +274,26 @@ export const DEFAULT_WALLET_HEADERS: WalletHeaderNames = {
 /** Reject a proof older or newer than this, in ms. Default: 5 minutes. */
 export const DEFAULT_PROOF_WINDOW_MS = 5 * 60 * 1000;
 
+/**
+ * How far in the future a proof's timestamp may be, in ms. Default: 30 seconds.
+ * This only absorbs client clock skew; it is deliberately much smaller than the
+ * back-dated window so a client cannot pre-date a long-lived proof.
+ */
+export const DEFAULT_FUTURE_SKEW_MS = 30 * 1000;
+
 /** Tracks consumed nonces so a captured proof cannot be replayed. */
 export interface NonceRegistry {
   /** True when the nonce was already used within its validity window. */
   has(nonce: string): Promise<boolean>;
   /** Record a nonce as used, expiring it at `expiresAtMs`. */
   add(nonce: string, expiresAtMs: number): Promise<void>;
+  /**
+   * Atomically record a nonce, returning `false` if it was already present.
+   * Preferred over `has` + `add`, which lets two concurrent copies of the same
+   * proof both pass the check before either is recorded. When a registry
+   * implements this the middleware uses it exclusively.
+   */
+  tryAdd?(nonce: string, expiresAtMs: number): Promise<boolean>;
 }
 
 export interface WalletSignatureOptions {
@@ -296,6 +310,8 @@ export interface WalletSignatureOptions {
   now?: () => number;
   /** Validity window for a proof, in ms. Default {@link DEFAULT_PROOF_WINDOW_MS}. */
   windowMs?: number;
+  /** Allowed clock skew for future-dated proofs, in ms. Default {@link DEFAULT_FUTURE_SKEW_MS}. */
+  futureSkewMs?: number;
   /** Set when wallets sign with the SEP-53 prefix. Default `true`. */
   sep53?: boolean;
   headers?: Partial<WalletHeaderNames>;
@@ -336,6 +352,7 @@ export function walletSignatureMiddleware(
     nonces,
     now = () => Date.now(),
     windowMs = DEFAULT_PROOF_WINDOW_MS,
+    futureSkewMs = DEFAULT_FUTURE_SKEW_MS,
     sep53 = true,
     onVerified,
   } = options;
@@ -373,10 +390,20 @@ export function walletSignatureMiddleware(
       return;
     }
 
-    // Both directions are checked: a proof from the far future is as invalid as
-    // an expired one, and accepting it would let a client mint a long-lived
-    // proof by simply sending a later timestamp.
-    if (Math.abs(now() - issuedAt) > windowMs) {
+    // Both directions are checked, with different tolerances: a stale proof is
+    // rejected after `windowMs`, while a future-dated one is rejected beyond a
+    // small clock-skew allowance. Accepting far-future timestamps would let a
+    // client mint a long-lived proof by simply sending a later timestamp.
+    const age = now() - issuedAt;
+    if (age < -futureSkewMs) {
+      reject(res, {
+        status: 401,
+        code: "WALLET_PROOF_FUTURE",
+        error: `Wallet proof timestamp is more than ${Math.round(futureSkewMs / 1000)}s in the future`,
+      });
+      return;
+    }
+    if (age > windowMs) {
       reject(res, {
         status: 401,
         code: "WALLET_PROOF_EXPIRED",
@@ -417,8 +444,20 @@ export function walletSignatureMiddleware(
     }
 
     if (nonces) {
+      // Scope the nonce to the verified address so one wallet cannot burn
+      // another wallet's nonces, and record it only after the signature has
+      // passed so unsigned junk cannot fill the registry.
+      const nonceKey = `${normalizedAddress}:${nonce}`;
+      const expiresAt = issuedAt + windowMs;
       try {
-        if (await nonces.has(nonce)) {
+        let fresh: boolean;
+        if (nonces.tryAdd) {
+          fresh = await nonces.tryAdd(nonceKey, expiresAt);
+        } else {
+          fresh = !(await nonces.has(nonceKey));
+          if (fresh) await nonces.add(nonceKey, expiresAt);
+        }
+        if (!fresh) {
           reject(res, {
             status: 401,
             code: "WALLET_NONCE_REUSED",
@@ -426,7 +465,6 @@ export function walletSignatureMiddleware(
           });
           return;
         }
-        await nonces.add(nonce, issuedAt + windowMs);
       } catch {
         // A failing nonce store must fail closed: without replay tracking the
         // window alone is not enough to distinguish a replay from a retry.
@@ -502,10 +540,22 @@ export class InMemoryNonceRegistry implements NonceRegistry {
     return true;
   }
 
+  /** Check-and-set with no `await` between the read and the write, so concurrent replays cannot both win. */
+  async tryAdd(nonce: string, expiresAtMs: number): Promise<boolean> {
+    const existing = this.used.get(nonce);
+    if (existing !== undefined && existing > this.now()) return false;
+    this.used.set(nonce, expiresAtMs);
+    this.prune();
+    return true;
+  }
+
   async add(nonce: string, expiresAtMs: number): Promise<void> {
     this.used.set(nonce, expiresAtMs);
-    // Opportunistically drop expired entries so the map cannot grow without
-    // bound under a stream of unique nonces.
+    this.prune();
+  }
+
+  /** Opportunistically drop expired entries so the map cannot grow without bound under unique nonces. */
+  private prune(): void {
     for (const [key, expires] of this.used) {
       if (expires <= this.now()) this.used.delete(key);
     }

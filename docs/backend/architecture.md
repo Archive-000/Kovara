@@ -149,6 +149,29 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+### Wallet signature replay protection (issue #955)
+
+When a `NonceRegistry` is supplied, `walletSignatureMiddleware` records each
+proof's nonce after the signature verifies and rejects a second use with
+`401 WALLET_NONCE_REUSED`. Nonces are stored as `<address>:<nonce>` so they are
+scoped to the signing wallet, and expire when the proof's validity window ends.
+A registry that implements `tryAdd` is used for an atomic check-and-set, so two
+concurrent copies of the same proof cannot both pass; `has` + `add` is only a
+fallback. If the registry fails, the request is refused (`503`), never allowed.
+`InMemoryNonceRegistry` is single-replica only; multi-replica deployments need a
+shared registry with the same atomic `tryAdd` semantics.
+
+### Address rate-limit key cardinality (issue #957)
+
+The per-address limiter keys its counters on the Stellar address found in the
+request. Because any well-formed address is a valid key, an attacker could
+otherwise create unbounded buckets. `BoundedAddressStore` keeps at most
+`ADDRESS_RATE_LIMIT_MAX_KEYS` buckets: each expires when its window ends, and if
+the cap is still exceeded, expired buckets are removed first and then the least
+recently used. A bucket that is being used is moved to the most-recent end on
+every hit, so cleanup does not reset the limit of an active address; only idle
+addresses are evicted. The store is per-process and in memory.
+
 ## 6. Observability
 
 - **Logging** (`Backend/src/logger.ts`) — `StructuredLogger` writes one JSON line

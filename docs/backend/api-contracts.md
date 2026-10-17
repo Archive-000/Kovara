@@ -214,6 +214,21 @@ See the "Known gaps" section of [`architecture.md`](./architecture.md): the
 `RATE_LIMIT_*` environment variables are not currently wired to this limiter, and
 the imported per-address limiter is not mounted.
 
+### Wallet signature proofs (issue #954)
+
+Routes guarded by `walletSignatureMiddleware` require a signed proof in the
+`x-wallet-address`, `x-wallet-signature`, `x-wallet-timestamp` (Unix ms) and
+`x-wallet-nonce` headers. The timestamp must be fresh:
+
+- A proof older than the validity window (default 5 minutes, `windowMs`) is rejected
+  with `401 WALLET_PROOF_EXPIRED`.
+- A proof dated in the future by more than the clock-skew allowance (default 30
+  seconds, `futureSkewMs`) is rejected with `401 WALLET_PROOF_FUTURE`.
+- A non-numeric timestamp is `400 WALLET_TIMESTAMP_INVALID`.
+
+Replayed nonces are rejected with `401 WALLET_NONCE_REUSED` (see
+[`architecture.md`](./architecture.md)).
+
 ### Errors
 
 Route-level errors:
