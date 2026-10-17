@@ -268,6 +268,42 @@ recently used. A bucket that is being used is moved to the most-recent end on
 every hit, so cleanup does not reset the limit of an active address; only idle
 addresses are evicted. The store is per-process and in memory.
 
+### Repeated-unfollow semantics (issue #931)
+
+An `Unfollow` event states a desired end state — "follower does not follow
+followee" — not a transition that may only happen once, so every delivery is
+judged against the graph as it is at that moment:
+
+- the relationship exists → it is deleted (`DELETE FROM follows WHERE follower =
+  $1 AND followee = $2`), and a racing duplicate affects zero rows;
+- the relationship is already gone → the handler logs the replay and returns
+  without issuing a write.
+
+No replay, ordering or repetition changes the outcome: N deliveries of the same
+`Unfollow` leave exactly the same relationship count as the first one, and
+unrelated edges in the graph are never touched. `handleUnfollow` therefore
+never fails on a repeat — a missing edge is a no-op, while a malformed event
+(missing `follower`/`followee`) still throws before any database call.
+
+### Like-count derivation (issues #932, #933)
+
+`handleLike` derives `posts.like_count` from the rows themselves instead of
+appending `+ 1`:
+
+```sql
+UPDATE posts
+SET like_count = (SELECT COUNT(*) FROM likes WHERE post_id = $1)
+WHERE id = $1 AND deleted_at IS NULL
+```
+
+The recount runs in the same `SERIALIZABLE` transaction as the insert, and the
+insert itself is guarded by the `(post_id, user_address)` unique constraint, so
+a redelivered or concurrently retried like can never move the count twice —
+after any number of replays the count equals the number of like rows. Before
+inserting anything the handler reads the post row and separates the two
+rejection cases: a **missing** post and a **soft-deleted** post (`deleted_at`
+set) each commit and return without creating a like row or touching the count.
+
 ## 6. Observability
 
 - **Logging** (`Backend/src/logger.ts`) — `StructuredLogger` writes one JSON line

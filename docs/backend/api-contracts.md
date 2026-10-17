@@ -229,6 +229,19 @@ Routes guarded by `walletSignatureMiddleware` require a signed proof in the
 Replayed nonces are rejected with `401 WALLET_NONCE_REUSED` (see
 [`architecture.md`](./architecture.md)).
 
+### Likes on deleted or missing posts (issue #933)
+
+Likes are ingested from chain events, not from a REST route, but the observable
+contract is the same one `GET /api/v1/posts/:id` publishes: `like_count` on a
+post counts likes that the post can actually hold.
+
+- A `like` delivery for a post that does not exist is dropped: no `likes` row is
+  created and the post's `like_count` is unchanged.
+- A `like` delivery for a soft-deleted post (`deleted_at` set) is dropped the
+  same way — deleting a post never leaves it able to gain new likes.
+- Both rejections are logged as warnings (`Like rejected: …`) and the delivery
+  completes successfully, so a bad delivery does not dead-letter the stream.
+
 ### Errors
 
 Route-level errors:
