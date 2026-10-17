@@ -150,6 +150,10 @@ export function usePoolDeposit(): UsePoolDepositReturn {
 
   const deposit = useCallback(
     async (poolId: string, amount: string, token: string) => {
+      if (pending) {
+        return;
+      }
+
       setPending(true);
       setError(null);
       setSuccess(false);
@@ -204,7 +208,7 @@ export function usePoolDeposit(): UsePoolDepositReturn {
         setPending(false);
       }
     },
-    [address, connected, contractId, rpcUrl]
+    [address, connected, contractId, rpcUrl, pending]
   );
 
   const reset = useCallback(() => {

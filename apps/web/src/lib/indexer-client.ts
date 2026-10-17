@@ -28,7 +28,11 @@ export class IndexerClient {
       const searchParams = new URLSearchParams();
       Object.entries(params).forEach(([key, value]) => {
         if (value !== undefined && value !== null) {
-          searchParams.append(key, String(value));
+          if (Array.isArray(value)) {
+            value.forEach((item) => searchParams.append(key, String(item)));
+          } else {
+            searchParams.append(key, String(value));
+          }
         }
       });
       const queryString = searchParams.toString();

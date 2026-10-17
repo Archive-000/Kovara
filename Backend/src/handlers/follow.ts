@@ -56,18 +56,23 @@ export async function handleFollow(db: Database, event: FollowEvent): Promise<vo
   });
 }
 /**
- * Handle a Follow event.
- *
- * Inserts a directed edge (follower → followee) into the follow graph.
- * Idempotent: if the follow already exists the handler returns immediately
- * without issuing a database write.
- */
-/**
  * Handle an Unfollow event.
  *
  * Removes the directed edge (follower → followee) from the follow graph.
- * Idempotent: if the follow doesn't exist the handler returns immediately
- * without issuing a database write.
+ *
+ * Repeated-unfollow semantics (issue #931): an Unfollow event states a desired
+ * *end state* — "follower does not follow followee" — not a transition that may
+ * only happen once. The chain may redeliver the same event after a crash, a
+ * replay window or an at-least-once transport, so every delivery is judged
+ * against the current graph:
+ *
+ *   - relationship present  → delete it exactly once (`DELETE ... WHERE` on the
+ *     `(follower, followee)` key, so a racing duplicate affects zero rows).
+ *   - relationship absent   → no-op that resolves without throwing; no write is
+ *     issued and relationship counts are left untouched.
+ *
+ * Neither delivery order nor repetition changes the final state, so N replays
+ * of the same Unfollow leave the same relationship count as the first one did.
  */
 export async function handleUnfollow(db: Database, event: UnfollowEvent): Promise<void> {
   if (!event.follower) {
@@ -78,7 +83,11 @@ export async function handleUnfollow(db: Database, event: UnfollowEvent): Promis
   }
 
   const existing = await db.getFollow(event.follower, event.followee);
-  if (!existing) return;
+  if (!existing) {
+    // Replay of an already-applied Unfollow: harmless no-op (issue #931).
+    logger.info(`Unfollow replay for ${event.follower}→${event.followee} is a no-op`);
+    return;
+  }
 
   await db.deleteFollow(event.follower, event.followee);
 }

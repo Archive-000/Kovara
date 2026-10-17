@@ -182,6 +182,7 @@ describe("LedgerIngestor.ingestRange", () => {
 describe("toDomainEvent", () => {
   const normalized: NormalizedStellarEvent = {
     eventId: "e1",
+    canonicalId: "e1",
     type: "post_created",
     ledger: 7,
     ledgerClosedAt: "2026-01-01T00:00:07Z",

@@ -297,6 +297,22 @@ describe("handleFollow — idempotency and replay safety (issue #928)", () => {
   function makeStatefulDb() {
     const relationships = new Set<string>();
     const key = (follower: string, followee: string): string => `${follower}:${followee}`;
+// ── Repeated-unfollow semantics (issue #931) ─────────────────────────────────
+
+describe("handleUnfollow — repeated deliveries (issue #931)", () => {
+  /**
+   * A stateful in-memory stand-in for the follows table: reads reflect writes,
+   * so a replayed event sees the graph as it actually is rather than a canned
+   * mock response. This is what lets the tests below assert on relationship
+   * *counts* across several deliveries.
+   */
+  function makeStatefulDb(): {
+    db: jest.Mocked<Database>;
+    relationships: Set<string>;
+  } {
+    const relationships = new Set<string>();
+    const key = (follower: string, followee: string): string => `${follower}:${followee}`;
+
     const db = {
       getFollow: jest.fn(async (follower: string, followee: string) =>
         relationships.has(key(follower, followee))
@@ -338,5 +354,86 @@ describe("handleFollow — idempotency and replay safety (issue #928)", () => {
     await handleFollow(db, FOLLOW); // replay
     expect(relationships.size).toBe(2);
     expect(db.insertFollow).toHaveBeenCalledTimes(2);
+      deleteFollow: jest.fn(async (follower: string, followee: string) => {
+        relationships.delete(key(follower, followee));
+      }),
+    } as unknown as jest.Mocked<Database>;
+
+    return { db, relationships };
+  }
+
+  const FOLLOW: FollowEvent = {
+    follower: "GABC123",
+    followee: "GXYZ789",
+    ledger: 100,
+  };
+  const UNFOLLOW: UnfollowEvent = {
+    follower: "GABC123",
+    followee: "GXYZ789",
+    ledger: 150,
+  };
+
+  it("deletes the relationship once, then replays are no-ops", async () => {
+    const { db, relationships } = makeStatefulDb();
+
+    await handleFollow(db, FOLLOW);
+    expect(relationships.size).toBe(1);
+
+    await handleUnfollow(db, UNFOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+
+    expect(relationships.size).toBe(0);
+    expect(db.deleteFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves relationship counts unchanged when the edge is already gone", async () => {
+    const { db, relationships } = makeStatefulDb();
+
+    await handleUnfollow(db, UNFOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+
+    expect(db.deleteFollow).not.toHaveBeenCalled();
+    expect(relationships.size).toBe(0);
+  });
+
+  it("does not touch unrelated relationships in the graph", async () => {
+    const { db, relationships } = makeStatefulDb();
+
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, { follower: "GOTHER1", followee: "GOTHER2", ledger: 101 });
+    expect(relationships.size).toBe(2);
+
+    await handleUnfollow(db, UNFOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+
+    expect(relationships.size).toBe(1);
+    expect(relationships.has("GOTHER1:GOTHER2")).toBe(true);
+    expect(relationships.has("GABC123:GXYZ789")).toBe(false);
+  });
+
+  it("converges on the same count for an interleaved replay sequence", async () => {
+    const { db, relationships } = makeStatefulDb();
+
+    await handleFollow(db, FOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+    await handleFollow(db, FOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+    await handleUnfollow(db, UNFOLLOW);
+    expect(relationships.size).toBe(0);
+
+    await handleFollow(db, FOLLOW);
+    expect(relationships.size).toBe(1);
+  });
+
+  it("rejects a malformed replayed unfollow without writing", async () => {
+    const { db, relationships } = makeStatefulDb();
+
+    await expect(
+      handleUnfollow(db, { ...UNFOLLOW, follower: "" })
+    ).rejects.toThrow("Unfollow event missing required field: follower");
+
+    expect(db.deleteFollow).not.toHaveBeenCalled();
+    expect(relationships.size).toBe(0);
   });
 });

@@ -294,7 +294,7 @@ export class LedgerIngestor {
       } catch (err) {
         // Nothing in this batch is durable, so none of it may count as seen or
         // the retry would skip it as a duplicate.
-        for (const event of accepted) this.seen.delete(event.eventId);
+        for (const event of accepted) this.seen.delete(event.canonicalId);
         logger.error("ingest_batch_processing_failed", {
           source: this.source.name,
           range,
