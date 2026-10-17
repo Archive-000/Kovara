@@ -290,3 +290,53 @@ describe("handleUnfollow", () => {
     await expect(handleUnfollow(db, event)).rejects.toThrow("DB delete failed");
   });
 });
+
+// ── Follow creation idempotency (issue #928) ─────────────────────────────────
+
+describe("handleFollow — idempotency and replay safety (issue #928)", () => {
+  function makeStatefulDb() {
+    const relationships = new Set<string>();
+    const key = (follower: string, followee: string): string => `${follower}:${followee}`;
+    const db = {
+      getFollow: jest.fn(async (follower: string, followee: string) =>
+        relationships.has(key(follower, followee))
+          ? { follower, followee, ledger: 100 }
+          : null
+      ),
+      insertFollow: jest.fn(async (follow: { follower: string; followee: string }) => {
+        relationships.add(key(follow.follower, follow.followee));
+      }),
+      deleteFollow: jest.fn(),
+    } as unknown as jest.Mocked<Database>;
+    return { db, relationships };
+  }
+
+  const FOLLOW: FollowEvent = { follower: "GABC123", followee: "GXYZ789", ledger: 100 };
+
+  it("repeated follow deliveries do not create duplicate relationships", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, FOLLOW);
+    expect(relationships.size).toBe(1);
+    expect(db.insertFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("follow replay leaves follower/following counts unchanged (no new rows)", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    const firstCount = relationships.size;
+    await handleFollow(db, { ...FOLLOW, ledger: 120 });
+    expect(relationships.size).toBe(firstCount);
+    expect(db.insertFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("multiple different follows are recorded independently", async () => {
+    const { db, relationships } = makeStatefulDb();
+    await handleFollow(db, FOLLOW);
+    await handleFollow(db, { follower: "GAAA", followee: "GBBB", ledger: 101 });
+    await handleFollow(db, FOLLOW); // replay
+    expect(relationships.size).toBe(2);
+    expect(db.insertFollow).toHaveBeenCalledTimes(2);
+  });
+});

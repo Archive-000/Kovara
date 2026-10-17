@@ -797,3 +797,46 @@ describe("API Routes", () => {
     });
   });
 });
+
+    it("accepts cursor-based pagination for followers and returns keyset shape", async () => {
+      db.getFollowersAfter.mockResolvedValueOnce({
+        followers: ["GABCDEF123456789012345678901234567890123456789012345678901234567",
+          "GHJKLMNOPQRSTUVWXYZ12345678901234567890123456789012345678901234567"],
+        total: 5,
+      });
+      const cursor = "GABCDEF123456789012345678901234567890123456789012345678901234567";
+      const res = await request(app).get(`/api/follows/${FOLLOW_ADDRESS}/followers?cursor=${cursor}&limit=2`);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        address: FOLLOW_ADDRESS,
+        followers: expect.arrayContaining([expect.stringMatching(/^G/)]),
+        total: 5,
+        limit: 2,
+        offset: 0,
+        has_more: true,
+        next_offset: null,
+        prev_offset: null,
+      });
+      expect(db.getFollowersAfter).toHaveBeenCalledWith(FOLLOW_ADDRESS, cursor, 2);
+    });
+
+    it("accepts cursor-based pagination for following and returns keyset shape", async () => {
+      db.getFollowingAfter.mockResolvedValueOnce({
+        following: ["GXYZABC123456789012345678901234567890123456789012345678901234567"],
+        total: 3,
+      });
+      const cursor = "GABCDEF123456789012345678901234567890123456789012345678901234567";
+      const res = await request(app).get(`/api/follows/${FOLLOW_ADDRESS}/following?cursor=${cursor}&limit=1`);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        address: FOLLOW_ADDRESS,
+        following: expect.arrayContaining([expect.stringMatching(/^G/)]),
+        total: 3,
+        limit: 1,
+        offset: 0,
+        has_more: false,
+        next_offset: null,
+        prev_offset: null,
+      });
+      expect(db.getFollowingAfter).toHaveBeenCalledWith(FOLLOW_ADDRESS, cursor, 1);
+    });

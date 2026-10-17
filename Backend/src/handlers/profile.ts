@@ -1,11 +1,5 @@
-/**
- * Handler for ProfileSet contract events.
- *
- * Upserts the profile record so the latest username and creator_token
- * are always reflected in the index.
- */
-
 import { Database } from "../db";
+import { logger } from "../logger";
 
 export interface ProfileSetEvent {
   user: string;
@@ -13,17 +7,7 @@ export interface ProfileSetEvent {
   creator_token: string;
   ledger: number;
 }
-/**
- * Handle a Follow event.
- *
- * Inserts a directed edge (follower → followee) into the follow graph.
- * Idempotent: if the follow already exists the handler returns immediately
- * without issuing a database write.
- */
-/**
- * Validate a raw event object has the shape expected for a ProfileSet event.
- * Throws a descriptive error for any missing or incorrectly typed field.
- */
+
 export function validateProfileEvent(event: unknown): asserts event is ProfileSetEvent {
   if (!event || typeof event !== "object") {
     throw new Error("ProfileSet event must be a non-null object");
@@ -46,8 +30,10 @@ export function validateProfileEvent(event: unknown): asserts event is ProfileSe
 /**
  * Handle a ProfileSet event emitted by the Kovara contract.
  *
- * Idempotent: calling this multiple times with the same data produces the
- * same result (upsert semantics).
+ * Protects against out-of-order delivery (issue #927): stale events — ones
+ * with an `updated_ledger` that is <= the stored profile's `updated_ledger` —
+ * must be ignored so newer profile state is not overwritten by a replayed
+ * older event. If no profile exists, apply the first event unconditionally.
  */
 export async function handleProfileSet(db: Database, event: ProfileSetEvent): Promise<void> {
   if (!event.user) {
@@ -60,6 +46,14 @@ export async function handleProfileSet(db: Database, event: ProfileSetEvent): Pr
   const trimmedUsername = event.username.trim();
   if (trimmedUsername === "") {
     throw new Error("ProfileSet event username must be non-empty after trimming");
+  }
+
+  const existing = await db.getProfile(event.user);
+  if (existing && event.ledger <= existing.updated_ledger) {
+    logger.info(
+      `Skipping stale ProfileSet for ${event.user} (event ledger ${event.ledger}, stored ledger ${existing.updated_ledger})`
+    );
+    return;
   }
 
   await db.upsertProfile({

@@ -265,3 +265,22 @@ Global handler / 404 catch-all (shared envelope):
 `/follows/{address}/followers`, `/follows/{address}/following`, `/pools/{id}`.
 It does **not** currently cover `/health`, `/version`, `/search/posts`,
 `/debug/snapshot`, the `/pools` list, or the version prefix.
+
+### Follow pagination cursor behavior (issue #929)
+
+The `/follows/:address/followers` and `/follows/:address/following` endpoints
+support both offset-based and cursor-based pagination:
+
+- `cursor` is optional. When present, it is treated as an opaque key (typically
+  the last wallet address returned in the previous page).
+- For cursor-based responses, `next_offset` and `prev_offset` are `null`; the
+  caller advances by passing the last element of `followers`/`following` as the
+  next `cursor`.
+- `has_more` is `true` if the number of items returned equals the requested
+  `limit`, indicating there may be more results after the returned page;
+  otherwise `false`. The `total` count is still returned for informational
+  purposes.
+- Cursor and offset are mutually exclusive in effect: when `cursor` is supplied,
+  the keyset path is used and the `offset` parameter in the response reflects
+  the requested value but navigation uses the cursor (not offsets). Errors for
+  invalid cursors follow `400 INVALID_CURSOR`.

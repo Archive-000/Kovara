@@ -184,3 +184,77 @@ describe("handleProfileSet", () => {
     await expect(handleProfileSet(db, event)).rejects.toThrow("DB connection lost");
   });
 });
+
+// ── Stale event protection (issue #927) ──────────────────────────────────────
+
+describe("handleProfileSet — stale event protection (issue #927)", () => {
+  function makeDb(existing?: { address: string; username: string; creator_token: string; updated_ledger: number }) {
+    return {
+      getProfile: jest.fn().mockResolvedValue(existing ?? null),
+      upsertProfile: jest.fn().mockResolvedValue(undefined),
+      getFollow: jest.fn(),
+      insertFollow: jest.fn(),
+      deleteFollow: jest.fn(),
+      insertPost: jest.fn(),
+      markPostDeleted: jest.fn(),
+      incrementPostLikeCount: jest.fn(),
+      addPostTipTotal: jest.fn(),
+      getPost: jest.fn(),
+      upsertLike: jest.fn(),
+      insertTip: jest.fn(),
+      upsertPool: jest.fn(),
+      adjustPoolBalance: jest.fn(),
+      insertPool: jest.fn(),
+      getPool: jest.fn(),
+      listPools: jest.fn().mockResolvedValue({ pools: [], total: 0 }),
+      addPoolAdmin: jest.fn(),
+      removePoolAdmin: jest.fn(),
+      listProfiles: jest.fn().mockResolvedValue({ profiles: [], total: 0 }),
+      listPosts: jest.fn(),
+      getFollowers: jest.fn(),
+      getFollowing: jest.fn(),
+      getFollowersAfter: jest.fn(),
+      getFollowingAfter: jest.fn(),
+      searchPosts: jest.fn().mockResolvedValue({ posts: [], total: 0 }),
+      getTokenMetadata: jest.fn().mockResolvedValue(null),
+    } as jest.Mocked<Database>;
+  }
+
+  it("applies event when no existing profile exists", async () => {
+    const db = makeDb(undefined);
+    await handleProfileSet(db, { user: "GA", username: "alice", creator_token: "T", ledger: 100 });
+    expect(db.upsertProfile).toHaveBeenCalledTimes(1);
+    expect(db.upsertProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ address: "GA", updated_ledger: 100 })
+    );
+  });
+
+  it("ignores event with lower ledger than stored (out of order)", async () => {
+    const db = makeDb({ address: "GA", username: "alice", creator_token: "T", updated_ledger: 200 });
+    await handleProfileSet(db, { user: "GA", username: "alice_old", creator_token: "T2", ledger: 150 });
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("ignores event with equal ledger as stored (stale/replay)", async () => {
+    const db = makeDb({ address: "GA", username: "alice", creator_token: "T", updated_ledger: 200 });
+    await handleProfileSet(db, { user: "GA", username: "alice_dup", creator_token: "T", ledger: 200 });
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("applies event with higher ledger than stored", async () => {
+    const db = makeDb({ address: "GA", username: "alice", creator_token: "T", updated_ledger: 200 });
+    await handleProfileSet(db, { user: "GA", username: "alice_new", creator_token: "T3", ledger: 250 });
+    expect(db.upsertProfile).toHaveBeenCalledTimes(1);
+    expect(db.upsertProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "alice_new", updated_ledger: 250 })
+    );
+  });
+
+  it("repeated out-of-order deliveries do not mutate profile", async () => {
+    const db = makeDb({ address: "GA", username: "alice", creator_token: "T", updated_ledger: 500 });
+    for (let i = 0; i < 3; i++) {
+      await handleProfileSet(db, { user: "GA", username: "stale", creator_token: "X", ledger: 400 });
+    }
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+});
