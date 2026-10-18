@@ -61,6 +61,17 @@ with every configuration problem listed if a required value is missing.
 | `DEBUG_TOKEN` | unset | Required for `GET /api/v1/debug/snapshot`; unset → `503`. |
 | `GIT_COMMIT` / `BUILD_TIME` | `unknown` | Surfaced by `GET /version`. |
 
+### Response cache capacity
+
+Each process keeps its response cache in memory. A `ResponseCache` instance holds
+at most 1,000 entries by default; callers that construct one directly can set
+`maxEntries` to a different non-negative safe integer (there is no environment
+variable for this setting). When a new entry exceeds the cap, entries past their
+full stale expiry are evicted first, then the oldest inserted entries are removed
+until the cache is within capacity. This keeps still-eligible stale values ahead
+of entries that can no longer be served. Capacity is per cache instance, not
+shared across replicas.
+
 ### Reconciliation dry run (issue #976)
 
 `dryRunReconciliation(store, runDate)` reports what a reconciliation would find
