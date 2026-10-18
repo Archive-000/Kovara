@@ -84,6 +84,105 @@ reading all of them in one transaction — so the cap turns that into a bounded,
 predictable cost and makes an over-large request fail loudly rather than being
 silently truncated.
 
+## Slashing is a governed, reversible process
+
+A slash takes a sentinel's stake immediately, but it is the start of a process
+rather than the end of one:
+
+```text
+ slash ──► Pending ──appeal──► Pending ──resolve──► Upheld | Reversed
+              │                  │
+              └──────────────────┘
+         appeal only until `appeal_deadline`
+```
+
+### Governance authorization
+
+Every slash operation — `slash`, `appeal_slash`, `resolve_slash` — requires the
+configured governance address, resolved by `require_governance`:
+
+| Stored `DataKey::Governance` | Caller | Result |
+| --- | --- | --- |
+| `Some(g)` | `g` | authorized |
+| `Some(g)` | anything else | `NotGovernance` |
+| absent | anything | `GovernanceNotConfigured` |
+
+There is **no fallback to the caller**. An ungoverned pool cannot be slashed at
+all, rather than being governed by whoever happened to sign the transaction.
+
+Governance is deliberately a separate key from `Admin`. Collapsing them would
+mean whoever can change `min_stake` can also confiscate stake. `set_governance`
+lets the admin rotate it; the old address loses the power on the next ledger.
+
+`initialize` takes `governance` explicitly rather than inferring it from `admin`
+— the two may be the same address for a single-operator deployment, but the
+contract never *assumes* that.
+
+### Evidence references
+
+`slash` takes a `SlashEvidence { proof_ref, uri, content_hash }`, stored on the
+`SlashRecord` and republished on `SlashedEvent`. The three fields answer the
+three questions an auditor asks: *which case*, *where is the record*, and *is
+this the record I am looking at* — the hash pins the content so a mutable URI
+cannot quietly change what the evidence says.
+
+A record with an empty `proof_ref` or an empty `uri` is refused with
+`InvalidEvidence`. The stake is taken immediately; a confiscation that cannot be
+pointed at its justification cannot be appealed on evidence either.
+
+`proof_ref` is a **data** field on the event, not a topic — it is
+high-cardinality, and adding it as a topic would bloat the topic set of a
+consumer filtering on "every slash for this reason".
+
+### The appeal window
+
+Each record carries the window in force when the slash was applied:
+
+```text
+appeal_deadline = slashed_at + appeal_window
+```
+
+An appeal is accepted while `ledger.sequence() <= appeal_deadline` and refused
+from the ledger after it with `AppealWindowClosed`.
+
+| Check | Meaning |
+| --- | --- |
+| `now <= appeal_deadline` | inside the window |
+| `now > appeal_deadline` | `AppealWindowClosed` |
+| `appeal_window == 0` | `AppealWindowClosed` — a zero window closes the deadline on the ledger the slash was applied |
+
+**The window is copied onto the record, so it is not retroactive.**
+`set_appeal_window` afterwards cannot close an appeal a sentinel is already
+entitled to file — otherwise shortening the window would be a way to retroactively
+strip an open appeal right.
+
+`appeal_window` is bounded by `MAX_APPEAL_WINDOW_LEDGERS` (6 000 000) so the
+deadline is representable in a `u64` for every reachable `slashed_at`. The
+default is `DEFAULT_APPEAL_WINDOW_LEDGERS` (604 800 — seven days).
+
+An appeal does **not** restore the stake. The slash stands until governance
+resolves it; the appeal only marks the record as disputed.
+
+The appellant may be the slashed sentinel or the governance address — the two
+parties to the dispute. Anyone else is refused.
+
+### Resolution is terminal and happens exactly once
+
+`resolve_slash(governance, proof_ref, uphold)` upholds or reverses a slash once.
+A second call is `AlreadyResolved`, whichever outcome it asks for. Without that
+constraint a reversed slash could be reversed again, restoring the same stake
+twice.
+
+| `uphold` | Effect |
+| --- | --- |
+| `true` | Stake stays removed; `restored == 0`; outcome `Upheld` |
+| `false` | `amount` added back with `checked_add`; outcome `Reversed` |
+
+A reversal that would overflow `i128` is refused with `InsufficientBalance`
+rather than wrapping the balance. The `outcome` check happens before every write,
+so a refused resolution leaves both the record and the stake untouched and the
+record is never half-resolved.
+
 ## Prerequisites
 
 - Rust **stable** (1.84+ recommended; the Soroban environment supports 1.82+)
