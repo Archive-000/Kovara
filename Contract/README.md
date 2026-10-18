@@ -84,6 +84,105 @@ reading all of them in one transaction — so the cap turns that into a bounded,
 predictable cost and makes an over-large request fail loudly rather than being
 silently truncated.
 
+## The withdrawal lock is a window, not a countdown
+
+A sentinel's lock is stored as one absolute ledger — `staked_at` — and runs
+until `unlock_at = staked_at + lock_period`. `unlock_at(env, sentinel)` returns
+that ledger, or `None` for an address that has never staked.
+
+### Lock arithmetic is checked
+
+`unlock_at` is derived with `checked_add`. An unrepresentable window returns
+`InvalidLockPeriod`; it is never saturated to `u64::MAX`, because a saturated
+window reads as "locked forever" without saying so.
+
+`withdraw` compares ledgers directly — `now < unlock_at` — rather than computing
+`now - staked_at` and comparing the difference. A saturating subtraction would
+silently report "the lock has elapsed" for a window that has not been reached;
+the direct comparison is exact at both boundaries.
+
+`lock_period` is additionally bounded by `MAX_LOCK_PERIOD` (1 000 000) at
+initialization, so every reachable unlock ledger is representable. The runtime
+check is kept anyway: bounding the parameter at configuration time and checking
+the arithmetic at use time are different guarantees.
+
+### A top-up never extends a running lock
+
+`stake` leaves `staked_at` untouched while `now < unlock_at`, and sets it to the
+current ledger once that window has elapsed.
+
+| Event | `staked_at` becomes |
+| --- | --- |
+| First deposit | current ledger |
+| Top-up **while the lock is running** | unchanged — the window does not move |
+| Top-up **at or after expiry** | current ledger — a fresh window |
+
+Both halves of that matter:
+
+* Letting a top-up move the window would let a sentinel push their own unlock
+  date out indefinitely by depositing one unit repeatedly — the lock becomes a
+  fee rather than a constraint.
+* Resetting it unconditionally on every deposit is worse: a top-up landing one
+  ledger before expiry would silently extend the lock by the full
+  `lock_period`, which is a trap rather than a policy.
+
+`stake` reads the existing start as an `Option`, not `unwrap_or(0)`, so a
+deposit that lands on genesis ledger `0` is a real recorded window and not
+mistaken for "never staked".
+
+## Slash amounts are bounded before anything is written
+
+`slash` checks three bounds, in order, all before the first write:
+
+| Bound | Error |
+| --- | --- |
+| `proof_id` is non-empty | `InvalidProofId` |
+| `amount > 0` | `InvalidSlashAmount` |
+| `amount <= current stake` | `SlashExceedsStake` |
+| remainder `>= min_stake` | `StakeBelowMinimum` |
+
+The three amount bounds are distinct conditions with distinct remedies — a
+malformed call, an unaffordable one, and one that would de-register the
+sentinel — so each gets its own error instead of collapsing into one.
+
+Because the balance map and the proof map are written only after every check
+passes, a refused slash leaves **both** the stake and the proof identifier
+untouched. An identifier that failed a call is still unused and still usable
+exactly once.
+
+## Slash proof identity
+
+Replay protection keys on a caller-supplied `proof_id`, not on
+`(sentinel, reason)`.
+
+That pair was not unique in either direction:
+
+* **False rejection.** Two genuinely distinct incidents against the same
+  sentinel sharing a reason code (`fraudulent_submission`) collided, and the
+  second was refused as a replay of the first.
+* **False acceptance.** One incident relabelled with a different reason code
+  passed twice.
+
+`proof_id` is a non-empty `String` chosen by the caller and required to be unique
+within the pool. `reason` stays a `Symbol` and an event topic for filtering, but
+carries no replay semantics.
+
+Uniqueness is global rather than per-sentinel: re-submitting an identifier is
+refused identically whether the sentinel, the reason, or both differ. That is the
+point — under the old `(sentinel, reason)` key the same case file could be
+applied against a second address simply by changing one component of the key.
+
+`slash_proof(proof_id)` returns the stored [`SlashProof`] — sentinel, reason,
+amount and ledger — so an auditor holding an identifier can ask the contract
+what it was applied to without replaying the event stream.
+
+### Event schema
+
+`SlashedEvent` gains `proof_id`, `remaining` and `slashed_at`. `proof_id` is
+deliberately **not** a topic: it is high-cardinality, and adding it as a topic
+would bloat the topic set of a consumer subscribed to "every slash for this
+reason".
+
 ## Prerequisites
 
 - Rust **stable** (1.84+ recommended; the Soroban environment supports 1.82+)
