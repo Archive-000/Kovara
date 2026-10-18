@@ -149,6 +149,12 @@ Request/response shapes and error codes are in
 `Backend/src/api/response.ts`; shared TypeScript response types live in
 `Backend/src/api/contracts.ts`.
 
+The request-context middleware also binds the request ID for downstream async
+work. JSON API error bodies with `error` and `code` include `requestId` when an
+active request context exists; calls made without request context leave the body
+unchanged. The same ID is echoed in `X-Request-Id` and the legacy
+`X-Correlation-Id` response headers. Successful JSON responses are not modified.
+
 ### Reward rule precedence (issue #975)
 
 `assessSubmission` is a pure function: the same submission and verifications
