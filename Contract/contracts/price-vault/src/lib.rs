@@ -132,6 +132,32 @@ pub enum Error {
     ArithmeticOverflow = 19,
     /// A multiplication would overflow the target type.
     ArithmeticOverflowMul = 20,
+
+    // ── access control ────────────────────────────────────────────────
+    /// The caller is not the contract admin.
+    Unauthorized = 21,
+    /// The country is not in the configured allowlist.
+    CountryNotAllowed = 22,
+    /// The category is not in the configured allowlist.
+    CategoryNotAllowed = 23,
+    /// The submitter may not write this category.
+    SubmitterNotAllowed = 24,
+    /// `initialize` was called more than once.
+    AlreadyInitialized = 25,
+}
+
+/// Which categories one submitter is allowed to write.
+///
+/// An **empty** `categories` list means "every category the registry accepts",
+/// which is what lets a deployment start open and be narrowed later without a
+/// storage migration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Authorization {
+    /// The submitter this policy applies to.
+    pub submitter: Address,
+    /// Categories this submitter may write; empty means all of them.
+    pub categories: Vec<Symbol>,
 }
 
 // ── Identifier registry ──────────────────────────────────────────────────────
@@ -406,6 +432,105 @@ pub const SUBMIT_SCHEMA: &[payload::Constraint] = &[
     payload::Constraint::SchemaVersion(SCHEMA_VERSION),
 ];
 
+// -- Access control -----------------------------------------------------------
+
+/// Load the admin, or [`Error::NotFound`] when the contract is unconfigured.
+fn load_admin(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotFound)
+}
+
+/// Reject a caller that is not the configured admin.
+///
+/// Checking the stored address *before* `require_auth` means an unauthorised
+/// caller is refused on one cheap storage read instead of paying for an auth
+/// prompt it could never satisfy.
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    if *admin != load_admin(env)? {
+        return Err(Error::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+/// Whether `country` passes the configured country allowlist.
+///
+/// An empty allowlist imposes no restriction: the static [`registry`] has
+/// already vetted the identifier, and "empty means no extra restriction" is
+/// what lets a deployment start open and be narrowed in a later governance
+/// action without a migration.
+fn country_allowed(env: &Env, country: &Symbol) -> bool {
+    let list: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::CountryAllowlist)
+        .unwrap_or_else(|| Vec::new(env));
+    if list.is_empty() {
+        return true;
+    }
+    for entry in list.iter() {
+        if &entry == country {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `category` passes the configured category allowlist.
+///
+/// Empty means unrestricted; see [`country_allowed`].
+fn category_allowed(env: &Env, category: &Symbol) -> bool {
+    let list: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::CategoryAllowlist)
+        .unwrap_or_else(|| Vec::new(env));
+    if list.is_empty() {
+        return true;
+    }
+    for entry in list.iter() {
+        if &entry == category {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `submitter` may write `category` under the configured policy.
+///
+/// Empty policy means unrestricted. Otherwise the submitter needs an entry, and
+/// that entry's `categories` must be empty (all categories) or contain
+/// `category`. An entry that does not cover the category is a refusal, not a
+/// fall-through to the next entry — otherwise a submitter with a narrow grant
+/// could be widened by a later duplicate entry for the same address.
+fn submitter_allowed(env: &Env, submitter: &Address, category: &Symbol) -> bool {
+    let policy: Vec<Authorization> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Authorizations)
+        .unwrap_or_else(|| Vec::new(env));
+    if policy.is_empty() {
+        return true;
+    }
+    for i in 0..policy.len() {
+        let entry = policy.get(i).unwrap();
+        if &entry.submitter == submitter {
+            if entry.categories.is_empty() {
+                return true;
+            }
+            for j in 0..entry.categories.len() {
+                if &entry.categories.get(j).unwrap() == category {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
+
 // ── Submission status ────────────────────────────────────────────────────────
 
 /// Lifecycle state of a single price submission.
@@ -471,6 +596,20 @@ pub enum DataKey {
     ///
     /// Lets history queries enumerate records without a full-storage scan.
     SubmissionIndex(Symbol, Symbol),
+
+    /// Admin allowed to manage the access-control configuration.
+    Admin,
+
+    /// `Vec<Symbol>` of countries submissions may be written for. Empty means
+    /// "every country the registry accepts".
+    CountryAllowlist,
+
+    /// `Vec<Symbol>` of categories submissions may be written for. Empty means
+    /// "every category the registry accepts".
+    CategoryAllowlist,
+
+    /// `Vec<Authorization>` describing who may write which category.
+    Authorizations,
 }
 
 // ── Domain types ─────────────────────────────────────────────────────────────
@@ -594,6 +733,19 @@ impl PriceVault {
         }
         if !registry::is_supported_category(&env, &category) {
             return Err(Error::InvalidCategory);
+        }
+
+        // Configurable narrowing of the static registry. An empty allowlist or
+        // policy imposes no restriction, so a deployment that never calls
+        // initialize behaves exactly as before.
+        if !country_allowed(&env, &country_iso) {
+            return Err(Error::CountryNotAllowed);
+        }
+        if !category_allowed(&env, &category) {
+            return Err(Error::CategoryNotAllowed);
+        }
+        if !submitter_allowed(&env, &submitter, &category) {
+            return Err(Error::SubmitterNotAllowed);
         }
 
         // 2. Payload schema — pure, before auth and before storage.
@@ -864,7 +1016,179 @@ impl PriceVault {
             .get(&DataKey::Price(country_iso, category, latest_ts))
     }
 
+    // -- Access control entry points -----------------------------------------
+
+    /// # Configure the access-control admin
+    ///
+    /// Idempotent-by-refusal: the first caller wins and every later call
+    /// returns [`Error::AlreadyInitialized`]. Without this a freshly deployed
+    /// contract would have no owner and nobody could ever narrow the
+    /// allowlists.
+    ///
+    /// A submission already accepts every registry identifier, so an
+    /// unconfigured contract is open rather than broken.
+    ///
+    /// # Errors
+    /// * [`Error::AlreadyInitialized`] — an admin is already set.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
+    }
+
+    /// The configured admin, or `None` when the contract is unconfigured.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Hand the admin role to a new address.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the current admin.
+    pub fn set_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
+    }
+
+    /// # Restrict which countries may receive submissions
+    ///
+    /// Narrows the static [`registry`]; it cannot widen it, because every
+    /// entry is validated against the registry first. An empty list clears the
+    /// restriction and returns the contract to registry-only behaviour.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCountry`] — an entry is not a registry identifier.
+    pub fn set_country_allowlist(
+        env: Env,
+        admin: Address,
+        countries: Vec<Symbol>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..countries.len() {
+            if !registry::is_supported_country(&env, &countries.get(i).unwrap()) {
+                return Err(Error::InvalidCountry);
+            }
+        }
+        env.storage().instance().set(&DataKey::CountryAllowlist, &countries);
+        Ok(())
+    }
+
+    /// The configured country allowlist. Empty means unrestricted.
+    pub fn get_country_allowlist(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CountryAllowlist)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// # Restrict which categories may receive submissions
+    ///
+    /// As with the country allowlist, an empty list clears the restriction.
+    /// Enforced in `submit` before `require_auth` and before any storage
+    /// access, so an unknown category costs the caller a single read.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCategory`] — an entry is not a registry identifier.
+    pub fn set_category_allowlist(
+        env: Env,
+        admin: Address,
+        categories: Vec<Symbol>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..categories.len() {
+            if !registry::is_supported_category(&env, &categories.get(i).unwrap()) {
+                return Err(Error::InvalidCategory);
+            }
+        }
+        env.storage().instance().set(&DataKey::CategoryAllowlist, &categories);
+        Ok(())
+    }
+
+    /// The configured category allowlist. Empty means unrestricted.
+    pub fn get_category_allowlist(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CategoryAllowlist)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// # Restrict which submitters may write which categories
+    ///
+    /// Replaces the whole policy. An empty policy imposes no restriction; an
+    /// entry with an empty `categories` grants every category. Every category
+    /// named in the policy is validated against the registry, so the policy
+    /// cannot grant a category that would be rejected anyway.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCategory`] — a named category is not a registry
+    ///   identifier.
+    pub fn set_authorizations(
+        env: Env,
+        admin: Address,
+        policy: Vec<Authorization>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..policy.len() {
+            let entry = policy.get(i).unwrap();
+            for j in 0..entry.categories.len() {
+                if !registry::is_supported_category(&env, &entry.categories.get(j).unwrap()) {
+                    return Err(Error::InvalidCategory);
+                }
+            }
+        }
+        env.storage().instance().set(&DataKey::Authorizations, &policy);
+        Ok(())
+    }
+
+    /// The configured submitter policy. Empty means unrestricted.
+    pub fn get_authorizations(env: Env) -> Vec<Authorization> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Authorizations)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Whether `submitter` may currently write `category`.
+    ///
+    /// Exposed so a client can check before building a transaction, rather
+    /// than discovering the refusal by submitting.
+    pub fn is_submitter_authorized(env: Env, submitter: Address, category: Symbol) -> bool {
+        submitter_allowed(&env, &submitter, &category)
+    }
+
+    /// Whether `country` currently passes the allowlist.
+    pub fn is_country_allowed(env: Env, country: Symbol) -> bool {
+        country_allowed(&env, &country)
+    }
+
+    /// Whether `category` currently passes the allowlist.
+    pub fn is_category_allowed(env: Env, category: Symbol) -> bool {
+        category_allowed(&env, &category)
+    }
+
     // ── Registry views ──────────────────────────────────────────────────
+
+    /// Whether `from -> to` is a permitted status transition.
+    ///
+    /// Publishes the transition table that `set_status` enforces, so a sentinel
+    /// daemon can ask "would this transition be accepted?" without submitting a
+    /// transaction that is going to be rejected. The answer is derived from the
+    /// same [`SubmissionStatus::can_transition_to`] the mutator uses, so the
+    /// view can never disagree with the enforcement.
+    ///
+    /// Returns `false` — never an error — for an unknown or terminal pair, so a
+    /// caller can use it as a plain boolean gate.
+    pub fn can_transition(from: SubmissionStatus, to: SubmissionStatus) -> bool {
+        from.can_transition_to(to)
+    }
 
     /// The supported ISO 3166-1 alpha-2 country codes.
     pub fn supported_countries(env: Env) -> Vec<Symbol> {
@@ -1699,6 +2023,349 @@ mod tests {
     }
 
     // ── pure helpers ────────────────────────────────────────────────────
+
+    // -- Access control (CT-53, CT-54, CT-55) ---------------------------
+
+    /// Deploy with an admin configured.
+    fn deploy_with_admin(env: &Env) -> (PriceVaultClient, Address, Address) {
+        let client = deploy(env);
+        let admin = Address::generate(env);
+        let submitter = Address::generate(env);
+        client.initialize(&admin);
+        (client, admin, submitter)
+    }
+
+    #[test]
+    fn initialize_is_once_only_and_records_the_admin() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(client.admin(), None);
+        client.initialize(&admin);
+        assert_eq!(client.admin(), Some(admin.clone()));
+        assert_eq!(
+            client.try_initialize(&admin).unwrap_err().unwrap(),
+            Error::AlreadyInitialized
+        );
+    }
+
+    #[test]
+    fn admin_can_be_handed_over() {
+        let env = make_env();
+        let (client, admin, _submitter) = deploy_with_admin(&env);
+        let successor = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.set_admin(&admin, &successor);
+        assert_eq!(client.admin(), Some(successor));
+    }
+
+    #[test]
+    fn a_non_admin_cannot_change_configuration() {
+        let env = make_env();
+        let (client, _admin, _submitter) = deploy_with_admin(&env);
+        let interloper = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_set_country_allowlist(&interloper, &vec![&env, sym(&env, "NG")])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_category_allowlist(&interloper, &vec![&env, sym(&env, "Food")])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_authorizations(&interloper, &vec![&env])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+    }
+
+    #[test]
+    fn allowlists_cannot_widen_the_registry() {
+        let env = make_env();
+        let (client, admin, _submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        // "ZZ" is not a registry country and "Weapons" is not a registry
+        // category, so neither can be allowlisted even though the allowlist is
+        // nominally the wider set.
+        assert_eq!(
+            client
+                .try_set_country_allowlist(&admin, &vec![&env, sym(&env, "ZZ")])
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCountry
+        );
+        assert_eq!(
+            client
+                .try_set_category_allowlist(&admin, &vec![&env, sym(&env, "Weapons")])
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+        assert_eq!(
+            client
+                .try_set_authorizations(
+                    &admin,
+                    &vec![
+                        &env,
+                        Authorization {
+                            submitter: Address::generate(&env),
+                            categories: vec![&env, sym(&env, "Weapons")],
+                        },
+                    ],
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+    }
+
+    #[test]
+    fn country_allowlist_narrows_submissions() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        let food = sym(&env, "Food");
+        env.mock_all_auths();
+
+        client.set_country_allowlist(&admin, &vec![&env, sym(&env, "NG")]);
+        assert_eq!(client.get_country_allowlist().len(), 1);
+
+        // In the allowlist: accepted.
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &food, 100, 10);
+        // Not in the allowlist: refused before auth and before storage.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "KE"),
+                    &food,
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::CountryNotAllowed
+        );
+        assert!(client.get(&sym(&env, "KE"), &food, &10).is_none());
+    }
+
+    #[test]
+    fn category_allowlist_narrows_submissions() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_category_allowlist(&admin, &vec![&env, sym(&env, "Food")]);
+        assert_eq!(client.get_category_allowlist().len(), 1);
+
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Rent"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::CategoryNotAllowed
+        );
+        assert!(client.get(&sym(&env, "NG"), &sym(&env, "Rent"), &10).is_none());
+    }
+
+    #[test]
+    fn an_empty_allowlist_imposes_no_restriction() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_country_allowlist(&admin, &vec![&env, sym(&env, "NG")]);
+        client.set_category_allowlist(&admin, &vec![&env, sym(&env, "Food")]);
+
+        // Clearing both restores registry-only behaviour.
+        client.set_country_allowlist(&admin, &vec![&env]);
+        client.set_category_allowlist(&admin, &vec![&env]);
+
+        submit_ok(&client, &submitter, &sym(&env, "KE"), &sym(&env, "Rent"), 100, 10);
+        assert!(client.get(&sym(&env, "KE"), &sym(&env, "Rent"), &10).is_some());
+    }
+
+    #[test]
+    fn a_submitter_may_be_confined_to_specific_categories() {
+        let env = make_env();
+        let (client, admin, baker) = deploy_with_admin(&env);
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+
+        // The baker may write Food and Rent only.
+        client.set_authorizations(
+            &admin,
+            &vec![
+                &env,
+                Authorization {
+                    submitter: baker.clone(),
+                    categories: vec![&env, sym(&env, "Food"), sym(&env, "Rent")],
+                },
+            ],
+        );
+        assert_eq!(client.get_authorizations().len(), 1);
+
+        submit_ok(&client, &baker, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        // Allowed category, refused category.
+        assert_eq!(
+            client
+                .try_submit(
+                    &baker,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Utilities"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::SubmitterNotAllowed
+        );
+        // A submitter with no entry at all is refused under a non-empty policy.
+        assert_eq!(
+            client
+                .try_submit(
+                    &stranger,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Food"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::SubmitterNotAllowed
+        );
+        assert!(client.is_submitter_authorized(&baker, &sym(&env, "Rent")));
+        assert!(!client.is_submitter_authorized(&baker, &sym(&env, "Utilities")));
+    }
+
+    #[test]
+    fn an_authorization_with_no_categories_grants_every_category() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_authorizations(
+            &admin,
+            &vec![
+                &env,
+                Authorization {
+                    submitter: submitter.clone(),
+                    categories: Vec::new(&env),
+                },
+            ],
+        );
+
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Health"), 100, 10);
+        assert!(client.is_submitter_authorized(&submitter, &sym(&env, "Health")));
+    }
+
+    #[test]
+    fn an_unconfigured_contract_accepts_any_registry_submission() {
+        // No initialize: the allowlists are empty and impose nothing, so
+        // pre-existing behaviour is unchanged.
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(client.admin(), None);
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        assert!(client.get(&sym(&env, "NG"), &sym(&env, "Food"), &10).is_some());
+        assert!(client.is_country_allowed(&sym(&env, "KE")));
+        assert!(client.is_category_allowed(&sym(&env, "Rent")));
+        assert!(client.is_submitter_authorized(&submitter, &sym(&env, "Food")));
+    }
+
+    // -- Transition table view (CT-56) -----------------------------------
+
+    #[test]
+    fn the_public_transition_view_matches_the_enforced_table() {
+        let env = make_env();
+        let client = deploy(&env);
+        let statuses = [
+            SubmissionStatus::Pending,
+            SubmissionStatus::Verified,
+            SubmissionStatus::Rejected,
+        ];
+
+        for from in statuses.iter() {
+            for to in statuses.iter() {
+                // The view and the mutator's table must never disagree.
+                assert_eq!(
+                    client.can_transition(from, to),
+                    from.can_transition_to(to),
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Verified));
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Rejected));
+        assert!(!client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Pending));
+        assert!(!client.can_transition(&SubmissionStatus::Verified, &SubmissionStatus::Pending));
+        assert!(!client.can_transition(&SubmissionStatus::Verified, &SubmissionStatus::Rejected));
+        assert!(!client.can_transition(&SubmissionStatus::Rejected, &SubmissionStatus::Verified));
+    }
+
+    #[test]
+    fn the_transition_view_predicts_what_set_status_will_do() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+
+        // Pending -> Verified is advertised as allowed, and is allowed.
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Verified));
+        client
+            .set_status(&verifier, &country, &category, &100, &SubmissionStatus::Verified)
+            .unwrap();
+
+        // Every transition out of the terminal state is advertised refused,
+        // and is refused with the stable InvalidTransition code.
+        for next in [
+            SubmissionStatus::Pending,
+            SubmissionStatus::Verified,
+            SubmissionStatus::Rejected,
+        ] {
+            assert!(!client.can_transition(&SubmissionStatus::Verified, &next));
+            assert_eq!(
+                client
+                    .try_set_status(&verifier, &country, &category, &100, &next)
+                    .unwrap_err()
+                    .unwrap(),
+                Error::InvalidTransition
+            );
+        }
+    }
 
     #[test]
     fn safe_arithmetic_entry_points() {
