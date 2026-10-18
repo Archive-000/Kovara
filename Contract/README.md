@@ -148,6 +148,95 @@ excessive withdrawal leaves the sentinel's stake exactly as it was — no partia
 write, no event. `stake(&sentinel, &i128::MAX)` therefore succeeds once (the
 balance *is* `i128::MAX`) and is refused on replay, because the second call is
 the one that would overflow.
+## The `min_stake` floor is a registration rule
+
+An address holding a non-zero stake is a **registered sentinel**, and a
+registered sentinel is expected to keep at least `min_stake` deposited for as
+long as it stays registered. `stake` enforces the floor on the way in and
+`withdraw` enforces it on the way out, so it holds at every balance the pool
+ever exposes — including the very first one, because `stake` compares the
+*resulting* balance rather than the increment.
+
+The rule, stated plainly:
+
+| Resulting balance | `stake` / `withdraw` |
+| --- | --- |
+| `== min_stake` | accepted |
+| `> min_stake` | accepted |
+| `< min_stake` | `StakeBelowMinimum` |
+| `0` | `StakeBelowMinimum` |
+
+So a **partial withdrawal may take a sentinel down to exactly `min_stake` and no
+further**. Withdrawing the whole balance is not available through `withdraw`,
+because a zero balance would silently de-register the address — and the pool has
+no separate step recording *why* an address stopped being a sentinel. Leaving
+the set is a lifecycle event with its own rules, not an arithmetic side effect
+of an amount.
+
+Raising `min_stake` above balances that already exist does not retroactively
+invalidate them, and it does not trap those sentinels: every withdrawal they
+attempt is refused with `StakeBelowMinimum` and their balance is preserved
+intact.
+
+## SentinelPool withdrawal accounting
+
+`withdraw` runs its checks in a fixed order and writes the balance map only once
+all of them pass:
+
+| # | Check | Error |
+| --- | --- | --- |
+| 1 | `amount > 0` | `InvalidStake` |
+| 2 | `amount <= balance` | `InsufficientBalance` |
+| 3 | lock elapsed | `LockPeriodActive` |
+| 4 | `balance - amount` via `checked_sub` | `InsufficientBalance` |
+| 5 | `balance - amount >= min_stake` | `StakeBelowMinimum` |
+
+Step 2 makes step 4 unreachable in practice; `checked_sub` is kept anyway so
+that `remaining` is derived by checked arithmetic on the line that consumes it.
+Because nothing is written until step 5 succeeds, **every** rejection — invalid
+amount, excessive amount, active lock, below-minimum remainder — leaves the
+sentinel's balance byte-for-byte unchanged and emits no event.
+
+## SentinelPool stake queries
+
+All three are views: they read storage and the ledger, write nothing, and emit
+nothing, so an indexer can poll them without perturbing the pool.
+
+| Call | Returns |
+| --- | --- |
+| `balance(sentinel)` | The deposited amount |
+| `staked_at(sentinel)` | Ledger sequence number the current lock started on |
+| `stake_of(sentinel)` | `SentinelStake { amount, staked_at, unlock_at, unlocked }` |
+| `total_active_stake()` | Sum of every deposited amount |
+
+`stake_of` is total: an address that never staked reports the zero record
+(`amount == 0`, `staked_at == 0`, `unlocked == true`) rather than failing, so a
+caller enumerating candidates never has to distinguish "not a sentinel yet" from
+"the read failed". `unlock_at` saturates rather than overflowing — it is a
+reporting value, and "the unlock ledger is unreachable" is more useful to a
+caller than a failed read.
+
+`total_active_stake` is **computed at read time**, not stored. A cached running
+total is one forgotten update away from disagreeing with the per-address
+balances it is supposed to summarize; folding the map costs one pass, which is
+the same order as any governance read that must see every sentinel. Sums
+saturate at `i128::MAX` instead of wrapping.
+
+## Stake events
+
+`StakedEvent` carries the resulting balance and the ledger the lock runs from:
+
+| Field | Why it is there |
+| --- | --- |
+| `sentinel` | **Topic** — who deposited |
+| `amount` | The increment, which alone does not reconstruct the position |
+| `total` | The balance *after* this deposit; two equal deposits against different starting balances are very different events |
+| `staked_at` | The ledger the deposit landed on, and therefore where the withdrawal lock starts |
+
+`amount` and `total` are both needed by an indexer that rebuilds balances from
+the event stream rather than by polling `balance`. The ledger sequence is read
+once inside `stake` and reused for both `StakedAt` storage and the event, so the
+stored timestamp and the published one cannot disagree.
 
 ## Prerequisites
 
