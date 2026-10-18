@@ -1,255 +1,175 @@
 #![no_std]
-//! `PriceVault` — stores raw price submissions keyed by `(country_iso,
-//! category, timestamp)`.
-//!
-//! This is the scaffolding landing pad for the Kovara price vault (CT-001).
-//! It wires the contract to the Soroban SDK and exposes a minimal, safe
-//! submission/read surface so the workspace builds and the storage layout is
-//! in place. Deeper submission semantics are owned by subsequent contract
-//! issues and will extend this crate.
-//!
-//! # Schema validation for serialized payloads (issue #739)
-//!
-//! Soroban contracts receive inputs as XDR-serialized values.  Before any
-//! of those values are used or persisted they must pass a schema validation
-//! step that is:
-//!
-//! - **Consistent**: the same `PayloadSchema` descriptor and `validate`
-//!   function are used across every entry point.
-//! - **Explicit**: every constraint is named as a variant of
-//!   [`ValidationError`]; there is no catch-all "invalid input" code.
-//! - **Pure**: validation never mutates state — it is a predicate over the
-//!   raw input values, callable before `require_auth` so malformed calls
-//!   are rejected at minimum cost.
-//!
-//! ## `payload` module
-//!
-//! The [`payload`] module is the single validation entry point.  It exposes:
-//!
-//! | Item | Purpose |
-//! |---|---|
-//! | [`payload::FieldKind`] | Discriminant for the type of a validated field. |
-//! | [`payload::Constraint`] | A named constraint applied to a single field. |
-//! | [`payload::PayloadSchema`] | An ordered list of `Constraint`s that fully describes what a valid payload looks like. |
-//! | [`payload::validate`] | Apply a `PayloadSchema` to a `SubmitPayload`, returning the first failing constraint as `Err(ValidationError)`. |
-//! | [`payload::SubmitPayload`] | A plain-struct view of the `submit` arguments, passed by value to `validate` so no cloning of contract-SDK types is needed. |
-//!
-//! ## Wiring into `submit`
-//!
-//! `PriceVault::submit` calls `payload::validate` with a fixed
-//! `SUBMIT_SCHEMA` before `require_auth` and before any storage access.
-//! A malformed payload is rejected at the gate — no auth side-effects, no
-//! partial writes, no ambiguous state.
-//!
-//! ## Extension pattern
-//!
-//! Any other contract entry point (e.g. a future `update_config`,
-//! `set_status`, or `aggregate`) follows the same pattern:
-//! 1. Define a `*Payload` struct capturing the raw arguments.
-//! 2. Define a `*_SCHEMA: &[Constraint]` constant.
-//! 3. Call `payload::validate(&schema, &payload)?` as the first line of the
-//!    entry point body.
-//!
-//! This is the "consistent validation across contract interfaces"
-//! acceptance criterion.
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol,
-};
-
-// ── Validation error codes ────────────────────────────────────────────────────
-//! # Fail-safe checks for zero and negative values (issue #728)
+//! `PriceVault` â€” stores raw price submissions keyed by `(country_iso,
+//! category, valid_from)`.
 //!
-//! All arithmetic entry points in this contract validate inputs through a
-//! single shared [`guards`] module before touching contract state.  The
-//! rules are:
-//!
-//! | Guard | Rule |
-//! |---|---|
-//! | `require_positive_price` | `value` must be `> 0`; zero or negative corrupts the KVI median. |
-//! | `require_positive_u64` | Generic `u64` must be `> 0`; used for timestamps and counts. |
-//! | `require_positive_i128` | Generic `i128` must be `> 0`; used for stake and reward amounts. |
-//! | `require_no_overflow_add` | `a.checked_add(b)` — panics would break contract execution; explicit error instead. |
-//! | `require_no_overflow_mul` | `a.checked_mul(b)` — same rationale. |
-//!
-//! Every guard is a pure function that returns `Err(Error::*)` rather than
-//! panicking.  Soroban contracts must never panic on bad input — a panic
-//! aborts the transaction and burns fees without giving the caller a
-//! meaningful error code.  All guards satisfy the
-//! "arithmetic functions fail safely instead of causing undefined behavior"
-//! acceptance criterion.
-//!
-//! ## Negative-path test coverage
-//!
-//! Every guard has at least one negative-path test (bad input → expected
-//! error) and at least one positive-path test (good input → `Ok`).  The
-//! aggregate test suite documents every rejected case, satisfying the
-//! "validation logic is asserted with negative-path tests" acceptance
-//! criterion.
-//! # Time-window tracking for price validity (issue #735)
-//!
-//! Every price submission now carries an explicit validity window:
+//! A submission is a single cost-of-living observation (bread, rent, transport,
+//! â€¦) made in a given country at a given moment. Each observation carries an
+//! explicit **validity window** and moves through a strict **verification
+//! state machine** before it can be aggregated into the Kovara index.
 //!
 //! ```text
-//! valid_from ──────────── valid_until
-//!     │                      │
+//!                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Verified   (terminal)
+//!  submit() â”€â”€â–º Pending â”€â”€â”¤
+//!                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Rejected   (terminal)
+//! ```
+//!
+//! # Design invariants
+//!
+//! ## Validation happens before auth, and before storage
+//!
+//! Every rejection path in [`PriceVault::submit`] is a **pure** predicate over
+//! the caller's arguments. The order is fixed:
+//!
+//! 1. [`registry`] â€” the country and category must be known identifiers.
+//! 2. [`payload`] â€” the arguments must satisfy [`SUBMIT_SCHEMA`].
+//! 3. [`guards`] â€” arithmetic is checked, never assumed.
+//!
+//! Only then does the contract call `require_auth` and touch storage. A
+//! malformed call therefore costs the caller nothing beyond the validation it
+//! already had to pay for, and can never leave a partial write behind.
+//!
+//! ## Validity windows
+//!
+//! ```text
+//! valid_from â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ valid_until
+//!     â”‚                      â”‚
 //!  earliest ledger ts     expiry ts (exclusive)
-//!  at which the price     after which the price
-//!  is considered fresh    is considered stale
 //! ```
 //!
-//! ## Design
+//! The lower bound is inclusive, the upper bound exclusive, so consecutive
+//! non-overlapping windows `[t, t+w)` and `[t+w, t+2w)` never both claim a
+//! query timestamp. [`PriceVault::is_valid_at`] is the canonical predicate;
+//! [`PriceVault::get_valid`] combines it with the read.
 //!
-//! **`valid_from`** is the observation timestamp supplied by the submitter
-//! (previously called `timestamp`; still the storage key component).
+//! ## Terminal states are terminal
 //!
-//! **`valid_until`** is `valid_from + validity_window_secs`.  The caller
-//! passes `validity_window_secs` at submission time.  A positive, non-zero
-//! window is required; zero or overflow are rejected with
-//! [`Error::InvalidWindow`].
+//! `Verified` and `Rejected` are absorbing. There is no path back to `Pending`
+//! and no path between them â€” see [`SubmissionStatus::can_transition_to`]. An
+//! attempt to leave a terminal state fails with [`Error::InvalidTransition`]
+//! and leaves the record byte-for-byte unchanged.
 //!
-//! **`DEFAULT_VALIDITY_WINDOW_SECS`** (86 400 s = 24 h) is the recommended
-//! window for daily cost-of-living price observations.  Callers may pass a
-//! different value but it must still be positive.
+//! ## Error codes are ABI
 //!
-//! ## Expiry checks
-//!
-//! [`PriceVault::is_valid_at`] is the canonical expiry predicate.  It
-//! returns `true` iff `valid_from <= query_ts < valid_until`.  The upper
-//! bound is exclusive so two consecutive non-overlapping windows
-//! `[t, t+w)` and `[t+w, t+2w)` share no overlap.
-//!
-//! The `KovaraIndex` aggregation logic — and any sentinel daemon — must
-//! call `is_valid_at` (or perform equivalent bounds checks) before
-//! incorporating a price submission into an index update, to satisfy the
-//! "expired entries are excluded" requirement.
-//!
-//! [`PriceVault::get_valid`] combines `get` and `is_valid_at`: it loads a
-//! submission and returns `Some(submission)` only if it is currently fresh,
-//! `None` if it has expired or was never recorded.  This is the recommended
-//! call for consumers that want a single authoritative "is this price
-//! usable?" answer.
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol,
-};
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Default validity window: 24 hours expressed in seconds.
-///
-/// A price observation submitted without an explicit window request should
-/// use this default.  24 h is appropriate for daily cost-of-living basket
-/// items (bread, rent, transport) where intra-day volatility is minimal.
-pub const DEFAULT_VALIDITY_WINDOW_SECS: u64 = 86_400;
-
-//! # Submission status model (issue #734)
-//!
-//! Every price submission now carries an explicit [`SubmissionStatus`] that
-//! moves through a strict, one-way state machine:
-//!
-//! ```text
-//! Pending ──► Verified
-//!         └─► Rejected
-//! ```
-//!
-//! - `Pending`  — the initial state of every freshly recorded submission.
-//! - `Verified` — the sentinel pool has reached quorum approval.
-//! - `Rejected` — the sentinel pool has reached quorum rejection, or the
-//!                submission has been invalidated by governance.
-//!
-//! Both `Verified` and `Rejected` are **terminal**: no further transition is
-//! allowed once either is reached.  An attempt to transition an already-
-//! terminal submission returns [`Error::InvalidTransition`].
-//!
-//! The state is stored as part of the [`PriceSubmission`] record so a single
-//! persistent-storage read returns both the price data and its current
-//! verification state — consistent with the acceptance criterion that API
-//! consumers can interpret statuses reliably without a second lookup.
-//!
-//! ## Transition enforcement
-//!
-//! [`PriceVault::set_status`] is the only public mutator of the status
-//! field.  It enforces:
-//! 1. The record exists (`Error::NotFound` otherwise).
-//! 2. The current status is `Pending` (`Error::InvalidTransition` if
-//!    already `Verified` or `Rejected`).
-//! 3. The caller passes a non-`Pending` target status — you cannot
-//!    re-set a submission to `Pending` (`Error::InvalidTransition`).
-//! 4. The caller has an authorized verifier address on the call
-//!    (`require_auth`).
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol,
-//! # Historical price view functions (issue #743)
-//!
-//! Three deterministic, read-only entry points are added so that tooling,
-//! dashboards and sentinel oracle nodes can audit and inspect the on-chain
-//! price record:
-//!
-//! | Function | What it returns |
-//! |---|---|
-//! | [`PriceVault::get_history`] | All submissions for a `(country_iso, category)` pair, ordered by ascending `timestamp`. |
-//! | [`PriceVault::get_history_range`] | A bounded subset of the above, filtered to `[from_ts, to_ts]` inclusive. |
-//! | [`PriceVault::get_latest`] | The single most-recent submission for a `(country_iso, category)` pair, or `None`. |
-//!
-//! ## Storage layout extension
-//!
-//! Each record is stored under the typed composite key
-//! `DataKey::Price(country, category, timestamp)`.  Its value is the complete
-//! `PriceSubmission`, so price, submitter, validity window, and status are read
-//! atomically and cannot drift across separately keyed metadata.  The enum
-//! variant and tuple components provide explicit namespaces and avoid building
-//! ambiguous keys by concatenating strings.
-//!
-//! `DataKey::SubmissionIndex(country, category)` stores a `Vec<u64>` of record
-//! timestamps for grouped lookups.  Each timestamp in the index identifies the
-//! corresponding `Price` key.  Both keys use the observation timestamp
-//! (`valid_from`); re-submitting the same composite key is a no-op and does not
-//! add a duplicate index entry.  Preserve these key variants and their
-//! component types across upgrades.  A future incompatible layout needs a new
-//! versioned key and an explicit migration; do not silently reinterpret old
-//! records.
-//!
-//! ## Query determinism
-//!
-//! All three view functions iterate the stored index and read records from
-//! `persistent` storage.  They never mutate state.  Identical contract state
-//! always produces identical return values, satisfying acceptance criterion 3.
+//! [`Error`] is `#[repr(u32)]` and its discriminants are part of the contract
+//! ABI: deployed clients map integer codes back to meanings. They are therefore
+//! allocated **contiguously from 1** and are **append-only**. A new condition
+//! gets the next free number; an existing number is never reused or renumbered,
+//! even if the condition it described is later removed.
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
-// ── Identifier registry (issue #689) ──────────────────────────────────
+// â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// The supported country and basket-category identifiers.
+/// Default validity window: 24 hours expressed in seconds.
 ///
-/// Country codes are ISO 3166-1 alpha-2 identifiers the protocol supports —
-/// a real subset of the standard, never an invented alphabet. Categories are
-/// the cost-of-living basket keys the protocol tracks.
+/// A price observation submitted without an explicit window should use this.
+/// 24 h suits daily cost-of-living basket items (bread, rent, transport) where
+/// intra-day volatility is minimal.
+pub const DEFAULT_VALIDITY_WINDOW_SECS: u64 = 86_400;
+
+/// The schema version this build of `PriceVault` understands.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Largest price value accepted by [`SUBMIT_SCHEMA`] (fixed-point units).
 ///
-/// The registry is deliberately not encoded in any storage key. Every stored
-/// record references an identifier by `Symbol`, and the identifier is validated
+/// The ceiling bounds how far one rogue submission can skew an index median.
+pub const MAX_PRICE: i128 = 1_000_000_000_000;
+
+/// Largest page [`PriceVault::get_submitter_history`] will return.
+///
+/// An unbounded history read is a denial-of-service vector: a submitter with
+/// thousands of records would force a caller to pay for reading all of them in
+/// one transaction. The cap turns that into a bounded, predictable cost, and
+/// [`Error::InvalidPageSize`] makes an over-large request fail loudly rather
+/// than being silently truncated.
+pub const MAX_HISTORY_PAGE_SIZE: u32 = 50;
+
+// â”€â”€ Errors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/// Errors returned by `PriceVault`.
+///
+/// Discriminants are contiguous from 1 and append-only â€” see the ABI note in
+/// the module docs.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum Error {
+    /// `valid_from` is zero.
+    InvalidTimestamp = 1,
+    /// `validity_window_secs` is zero, or `valid_from + window` overflows.
+    InvalidWindow = 2,
+    /// `from_ts > to_ts` in a range query.
+    InvalidRange = 3,
+    /// The country is not a supported ISO 3166-1 alpha-2 identifier.
+    InvalidCountry = 4,
+    /// The category is not a supported basket category identifier.
+    InvalidCategory = 5,
+    /// The requested status transition is not permitted.
+    InvalidTransition = 6,
+    /// No submission exists for the given key.
+    NotFound = 7,
+
+    // â”€â”€ payload schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A required field is missing.
+    MissingRequiredField = 8,
+    /// A field value is below its declared minimum.
+    ValueBelowMinimum = 9,
+    /// A field value is above its declared maximum.
+    ValueAboveMaximum = 10,
+    /// A `Symbol` field is empty.
+    EmptySymbol = 11,
+    /// A numeric field is negative where non-negative is required.
+    NegativeNotAllowed = 12,
+    /// A numeric field is zero where strictly positive is required.
+    ZeroNotAllowed = 13,
+    /// The payload's schema version is not the one this build understands.
+    SchemaMismatch = 14,
+
+    // â”€â”€ guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A price value was zero.
+    ZeroPrice = 15,
+    /// A price value was negative.
+    NegativePrice = 16,
+    /// A `u64` that must be positive was zero.
+    ZeroValue = 17,
+    /// An `i128` amount that must be positive was zero or negative.
+    NonPositiveAmount = 18,
+    /// An addition would overflow the target type.
+    ArithmeticOverflow = 19,
+    /// A multiplication would overflow the target type.
+    ArithmeticOverflowMul = 20,
+
+    // â”€â”€ bounded history queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A page size was zero or above [`MAX_HISTORY_PAGE_SIZE`].
+    InvalidPageSize = 21,
+}
+
+// â”€â”€ Identifier registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/// The set of country and basket-category identifiers the protocol understands.
+///
+/// The registry is deliberately **not** encoded in any storage key. Every stored
+/// record references an identifier by `Symbol`, and the identifier is checked
 /// against this registry at the contract boundary, so adding a country or a
-/// category later is a code change that leaves previously stored records — and
-/// their keys — untouched. Extending the registry therefore needs no storage
-/// migration and cannot invalidate existing submissions.
+/// category later is a code change that leaves previously stored records â€” and
+/// their keys â€” untouched. Extending it therefore needs no storage migration
+/// and cannot invalidate existing submissions.
 pub mod registry {
     use soroban_sdk::{Env, Symbol, Vec};
 
     /// Supported ISO 3166-1 alpha-2 country codes.
     ///
-    /// A real subset of the standard: each entry is a designated ISO 3166-1
-    /// alpha-2 identifier. Extend this list to add a country.
+    /// A real subset of the standard: every entry is a designated ISO 3166-1
+    /// alpha-2 identifier.
     pub const COUNTRY_CODES: &[&str] = &[
         "US", "GB", "NG", "KE", "IN", "BR", "DE", "FR", "JP", "CN", "ZA", "GH", "EG", "TZ", "UG",
         "ET", "PH", "ID", "MX", "AR",
     ];
 
     /// Supported cost-of-living basket categories.
-    ///
-    /// Extend this list to add a category.
     pub const CATEGORIES: &[&str] = &["Food", "Rent", "Transport", "Utilities", "Health"];
 
     /// Version of the identifier registry.
@@ -278,78 +198,110 @@ pub mod registry {
 
     /// Whether `country_iso` is a supported ISO 3166-1 alpha-2 identifier.
     pub fn is_supported_country(env: &Env, country_iso: &Symbol) -> bool {
-        for code in COUNTRY_CODES.iter() {
-            if &Symbol::new(env, code) == country_iso {
-                return true;
-            }
-        }
-        false
+        COUNTRY_CODES
+            .iter()
+            .any(|code| &Symbol::new(env, code) == country_iso)
     }
 
     /// Whether `category` is a supported basket category identifier.
     pub fn is_supported_category(env: &Env, category: &Symbol) -> bool {
-        for key in CATEGORIES.iter() {
-            if &Symbol::new(env, key) == category {
-                return true;
-            }
-        }
-        false
+        CATEGORIES
+            .iter()
+            .any(|key| &Symbol::new(env, key) == category)
     }
 }
 
-// ── Error codes ───────────────────────────────────────────────────────────────
+// â”€â”€ Fail-safe arithmetic guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    /// The provided `valid_from` timestamp is zero or otherwise unusable.
-    InvalidTimestamp = 1,
-    // ── Schema validation errors (issue #739) ─────────────────────────────
-    /// A required field is missing (currently unused in the on-chain path
-    /// because all fields are positional, but exported for SDK consumers).
-    MissingRequiredField = 2,
-    /// A field value is below its declared minimum.
-    ValueBelowMinimum = 3,
-    /// A field value is above its declared maximum.
-    ValueAboveMaximum = 4,
-    /// A Symbol field is empty (length == 0).
-    EmptySymbol = 5,
-    /// A numeric field is negative where only non-negative values are
-    /// permitted.
-    NegativeNotAllowed = 6,
-    /// A numeric field is zero where only strictly positive values are
-    /// permitted.
-    ZeroNotAllowed = 7,
-    /// The schema version embedded in the payload does not match the
-    /// contract's current schema version.
-    SchemaMismatch = 8,
-    /// `from_ts` is greater than `to_ts` in a range query.
+/// Centralised arithmetic safety guards.
+///
+/// Every guard is a pure function returning `Err` rather than panicking. A
+/// panic in a Soroban contract aborts the transaction without emitting an error
+/// code, burning caller fees and leaving no diagnosable trace â€” so overflow and
+/// bad input are always values, never faults.
+pub mod guards {
+    use super::Error;
+
+    /// Reject a price value that is zero or negative.
     ///
-    /// Appended as 9 rather than reusing 2: `#[contracterror]` discriminants
-    /// are part of the contract ABI, so renumbering an existing variant would
-    /// silently change the code every deployed client already maps.
-    InvalidRange = 9,
-    /// The country code is not a supported ISO 3166-1 alpha-2 identifier.
-    InvalidCountry = 10,
-    /// The category is not a supported basket category identifier.
-    InvalidCategory = 11,
+    /// # Errors
+    /// * [`Error::NegativePrice`] â€” `value < 0`
+    /// * [`Error::ZeroPrice`] â€” `value == 0`
+    #[inline]
+    pub fn require_positive_price(value: i128) -> Result<(), Error> {
+        if value < 0 {
+            return Err(Error::NegativePrice);
+        }
+        if value == 0 {
+            return Err(Error::ZeroPrice);
+        }
+        Ok(())
+    }
+
+    /// Reject a `u64` value that is zero.
+    ///
+    /// # Errors
+    /// * [`Error::ZeroValue`] â€” `value == 0`
+    #[inline]
+    pub fn require_positive_u64(value: u64) -> Result<(), Error> {
+        if value == 0 {
+            return Err(Error::ZeroValue);
+        }
+        Ok(())
+    }
+
+    /// Reject an `i128` amount that is zero or negative.
+    ///
+    /// # Errors
+    /// * [`Error::NonPositiveAmount`] â€” `amount <= 0`
+    #[inline]
+    pub fn require_positive_i128(amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::NonPositiveAmount);
+        }
+        Ok(())
+    }
+
+    /// Checked `u64` addition.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflow`] â€” the result would exceed `u64::MAX`.
+    #[inline]
+    pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
+        a.checked_add(b).ok_or(Error::ArithmeticOverflow)
+    }
+
+    /// Checked `i128` addition.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflow`] â€” the result would overflow `i128`.
+    #[inline]
+    pub fn checked_add_i128(a: i128, b: i128) -> Result<i128, Error> {
+        a.checked_add(b).ok_or(Error::ArithmeticOverflow)
+    }
+
+    /// Checked `i128` multiplication.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflowMul`] â€” the result would overflow `i128`.
+    #[inline]
+    pub fn checked_mul_i128(a: i128, b: i128) -> Result<i128, Error> {
+        a.checked_mul(b).ok_or(Error::ArithmeticOverflowMul)
+    }
 }
 
-// ── payload module ────────────────────────────────────────────────────────────
+// â”€â”€ Payload schema validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Schema validation for serialized payloads.
+/// Schema validation for external payloads.
 ///
-/// Every contract entry point that receives external input should:
-/// 1. Define a `*Payload` struct for its arguments.
-/// 2. Declare a `*_SCHEMA` constant (`&[Constraint]`).
-/// 3. Call `validate(&schema, &payload)?` before any auth check or
-///    state mutation.
+/// Every entry point that receives external input should:
+/// 1. define a `*Payload` struct for its arguments,
+/// 2. declare a `*_SCHEMA` constant (`&[Constraint]`),
+/// 3. call `validate(&schema, &payload)?` **before** any auth check or state
+///    mutation.
 pub mod payload {
     use super::Error;
     use soroban_sdk::Symbol;
-
-    // ── Field kinds ───────────────────────────────────────────────────────
 
     /// Discriminant for the type of a validated field.
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -362,43 +314,38 @@ pub mod payload {
         Symbol,
     }
 
-    // ── Constraint ────────────────────────────────────────────────────────
-
     /// A single named constraint applied to a payload field.
     ///
-    /// Constraints are evaluated in declaration order.  The first failing
-    /// constraint causes `validate` to return `Err` immediately — there is
-    /// no accumulation of errors, which is consistent with how Soroban
-    /// contracts communicate failures to callers.
+    /// Constraints are evaluated in declaration order and the first failure
+    /// returns immediately â€” there is no error accumulation, which is how
+    /// Soroban contracts communicate a single failure to a caller.
     #[derive(Copy, Clone, Debug)]
     pub enum Constraint {
         /// The `u64` field must be strictly greater than zero.
         U64NonZero,
         /// The `u64` field must be at most this value.
         U64Max(u64),
-        /// The `i128` field must be greater than zero.
+        /// The `i128` field must be strictly positive.
         I128Positive,
-        /// The `i128` field must be greater than or equal to zero.
+        /// The `i128` field must be zero or positive.
         I128NonNegative,
         /// The `i128` field must be at most this value.
         I128Max(i128),
-        /// The `Symbol` field must have at least one character.
+        /// The `Symbol` fields must each have at least one character.
         SymbolNonEmpty,
-        /// The schema version embedded in the payload must equal this value.
+        /// The payload's schema version must equal this value.
         SchemaVersion(u32),
     }
 
-    // ── SubmitPayload ─────────────────────────────────────────────────────
-
-    /// A plain-data view of the `PriceVault::submit` arguments.
+    /// A plain-data view of the `submit` arguments.
     ///
-    /// Decoupling validation from the Soroban `Env` and `Address` types
-    /// keeps `validate` a pure function — no SDK imports needed in the
-    /// validation logic itself, no mock environment required in tests.
+    /// Decoupling validation from `Env` and `Address` keeps [`validate`] a pure
+    /// function: no SDK imports in the validation logic, no mock environment
+    /// needed to test it.
     pub struct SubmitPayload<'a> {
-        /// ISO country code (e.g. "NG", "KE").
+        /// ISO country code (e.g. `"NG"`).
         pub country_iso: &'a Symbol,
-        /// Basket category (e.g. "Food", "Rent").
+        /// Basket category (e.g. `"Food"`).
         pub category: &'a Symbol,
         /// Price value in the smallest fixed-point unit.
         pub value: i128,
@@ -408,21 +355,12 @@ pub mod payload {
         pub schema_version: u32,
     }
 
-    // ── validate ──────────────────────────────────────────────────────────
-
-    /// Apply a schema (ordered list of [`Constraint`]s) to a
-    /// [`SubmitPayload`].
+    /// Apply `schema` to `payload`, returning the first failing constraint.
     ///
-    /// Returns `Ok(())` when every constraint passes, or
-    /// `Err(Error::*)` on the first failing constraint.
-    ///
-    /// The function is `#[inline]` so the optimiser can fold constant
-    /// schemas fully at the call site in release builds.
+    /// `#[inline]` so the optimiser can fold constant schemas at the call site
+    /// in release builds.
     #[inline]
-    pub fn validate(
-        schema: &[Constraint],
-        payload: &SubmitPayload<'_>,
-    ) -> Result<(), Error> {
+    pub fn validate(schema: &[Constraint], payload: &SubmitPayload<'_>) -> Result<(), Error> {
         for constraint in schema {
             match constraint {
                 Constraint::U64NonZero => {
@@ -454,9 +392,7 @@ pub mod payload {
                     }
                 }
                 Constraint::SymbolNonEmpty => {
-                    // Soroban Symbol::len() returns the number of characters.
-                    // A zero-length Symbol is rejected as it would produce an
-                    // unresolvable storage key.
+                    // A zero-length Symbol would produce an unresolvable key.
                     if payload.country_iso.len() == 0 || payload.category.len() == 0 {
                         return Err(Error::EmptySymbol);
                     }
@@ -472,343 +408,265 @@ pub mod payload {
     }
 }
 
-// ── Schema constant ───────────────────────────────────────────────────────────
-
 /// The schema applied to every `PriceVault::submit` call.
 ///
-/// Constraints are evaluated left-to-right; the first failure is returned.
-/// The ordering is chosen so that the cheapest checks (integer bounds) run
-/// before the more expensive ones (Symbol length).
-const SUBMIT_SCHEMA: &[payload::Constraint] = &[
-    // Timestamp must be a positive u64.
+/// Ordered cheapest-first: integer bounds run before `Symbol` length checks.
+pub const SUBMIT_SCHEMA: &[payload::Constraint] = &[
     payload::Constraint::U64NonZero,
-    // Price must be strictly positive.
     payload::Constraint::I128Positive,
-    // Price must not exceed the operational ceiling (1 billion in fixed-point
-    // units prevents absurd index skew from rogue submissions).
-    payload::Constraint::I128Max(1_000_000_000_000),
-    // Country and category symbols must not be empty strings.
+    payload::Constraint::I128Max(MAX_PRICE),
     payload::Constraint::SymbolNonEmpty,
-    // Schema version must match this build.
-    payload::Constraint::SchemaVersion(1),
+    payload::Constraint::SchemaVersion(SCHEMA_VERSION),
 ];
 
-/// The schema version this build of PriceVault understands.
-pub const SCHEMA_VERSION: u32 = 1;
-    /// A price value was zero; zero prices corrupt the index median.
-    ZeroPrice = 2,
-    /// A price value was negative; negative prices are nonsensical for
-    /// cost-of-living observations.
-    NegativePrice = 3,
-    /// A u64 value that must be positive was zero.
-    ZeroValue = 4,
-    /// An i128 value that must be positive was zero or negative.
-    NonPositiveAmount = 5,
-    /// An arithmetic addition would overflow the target type.
-    ArithmeticOverflow = 6,
-    /// An arithmetic multiplication would overflow the target type.
-    ArithmeticOverflowMul = 7,
-}
-
-// ── Fail-safe arithmetic guards (issue #728) ──────────────────────────────────
-
-/// Centralised arithmetic safety guards.
-///
-/// Every public contract entry point that performs arithmetic or stores a
-/// value that is constrained to a numeric range calls one of these guards
-/// before mutating state.  Returning `Err` rather than panicking is
-/// mandatory in Soroban: a panic aborts the transaction without emitting
-/// an error code, making debugging impossible and burning caller fees.
-pub mod guards {
-    use super::Error;
-
-    /// Reject a price value that is zero or negative.
-    ///
-    /// Zero prices are excluded because they would skew a trimmed-median
-    /// to zero, producing a nonsensical index value.  Negative prices are
-    /// structurally invalid for cost-of-living observations.
-    ///
-    /// # Errors
-    /// * [`Error::ZeroPrice`] — `value == 0`
-    /// * [`Error::NegativePrice`] — `value < 0`
-    #[inline]
-    pub fn require_positive_price(value: i128) -> Result<(), Error> {
-        if value < 0 {
-            return Err(Error::NegativePrice);
-        }
-        if value == 0 {
-            return Err(Error::ZeroPrice);
-        }
-        Ok(())
-    }
-
-    /// Reject a `u64` value that is zero.
-    ///
-    /// Used for timestamps, counts, and any other `u64` field that must be
-    /// strictly positive.
-    ///
-    /// # Errors
-    /// * [`Error::ZeroValue`] — `value == 0`
-    #[inline]
-    pub fn require_positive_u64(value: u64) -> Result<(), Error> {
-        if value == 0 {
-            return Err(Error::ZeroValue);
-        }
-        Ok(())
-    }
-
-    /// Reject an `i128` amount that is zero or negative.
-    ///
-    /// Used for stake and reward amounts that must represent a meaningful
-    /// positive quantity.
-    ///
-    /// # Errors
-    /// * [`Error::NonPositiveAmount`] — `amount <= 0`
-    #[inline]
-    pub fn require_positive_i128(amount: i128) -> Result<(), Error> {
-        if amount <= 0 {
-            return Err(Error::NonPositiveAmount);
-        }
-        Ok(())
-    }
-
-    /// Perform a checked `u64` addition, returning `Error::ArithmeticOverflow`
-    /// instead of wrapping or panicking.
-    ///
-    /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — the result would exceed `u64::MAX`.
-    #[inline]
-    pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
-        a.checked_add(b).ok_or(Error::ArithmeticOverflow)
-    }
-
-    /// Perform a checked `i128` addition, returning `Error::ArithmeticOverflow`
-    /// instead of wrapping or panicking.
-    ///
-    /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — the result would exceed `i128::MAX`
-    ///   or fall below `i128::MIN`.
-    #[inline]
-    pub fn checked_add_i128(a: i128, b: i128) -> Result<i128, Error> {
-        a.checked_add(b).ok_or(Error::ArithmeticOverflow)
-    }
-
-    /// Perform a checked `i128` multiplication, returning
-    /// `Error::ArithmeticOverflowMul` instead of wrapping or panicking.
-    ///
-    /// # Errors
-    /// * [`Error::ArithmeticOverflowMul`] — the result would overflow `i128`.
-    #[inline]
-    pub fn checked_mul_i128(a: i128, b: i128) -> Result<i128, Error> {
-        a.checked_mul(b).ok_or(Error::ArithmeticOverflowMul)
-    }
-    /// `validity_window_secs` is zero, or `valid_from + window` would
-    /// overflow `u64`.
-    InvalidWindow = 2,
-    /// The requested state transition is not permitted.
-    ///
-    /// Fires when:
-    /// - transitioning a `Verified` or `Rejected` submission (terminal state),
-    /// - attempting to set status back to `Pending`.
-    InvalidTransition = 2,
-    /// The submission does not exist.
-    NotFound = 3,
-}
-
-// ── Status enum (issue #734) ──────────────────────────────────────────────────
+// â”€â”€ Submission status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Lifecycle state of a single price submission.
 ///
-/// The state machine is strictly one-way:
-///
 /// ```text
-/// Pending ──► Verified
-///         └─► Rejected
+/// Pending â”€â”€â–º Verified   (terminal)
+///         â””â”€â–º Rejected   (terminal)
 /// ```
 ///
-/// Both [`SubmissionStatus::Verified`] and [`SubmissionStatus::Rejected`] are
-/// terminal — no further transition is accepted once either is stored.
-///
-/// Consumers that interpret status values — sentinel daemons, API response
-/// serializers, SDK clients — should match exhaustively on all three variants
-/// so they remain correct when additional variants are added in a future
-/// schema version.
+/// Consumers matching on status should match exhaustively on all three
+/// variants so they stay correct when more are added in a future schema
+/// version.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SubmissionStatus {
-    /// The submission has been recorded and is awaiting verifier votes.
+    /// Recorded, awaiting verifier votes.
     Pending = 0,
-    /// The sentinel pool reached quorum approval; this submission is
-    /// accepted as a valid price observation.
+    /// Quorum approval; accepted as a valid price observation.
     Verified = 1,
-    /// The sentinel pool reached quorum rejection, or the submission was
-    /// invalidated by a governance actor.
+    /// Quorum rejection, or invalidated by governance.
     Rejected = 2,
 }
 
 impl SubmissionStatus {
-    /// Returns `true` for terminal states from which no further transition
-    /// is valid.
+    /// Whether this state absorbs: no transition leaves it.
     #[inline]
     pub fn is_terminal(self) -> bool {
         matches!(self, SubmissionStatus::Verified | SubmissionStatus::Rejected)
     }
+
+    /// # The transition table
+    ///
+    /// Whether `self -> next` is a permitted transition.
+    ///
+    /// Exactly one edge exists: `Pending -> {Verified, Rejected}`. `Pending`
+    /// is never a *target* (it is only ever the initial state assigned by
+    /// `submit`), and terminal states have no outgoing edges. Encoding this as
+    /// a function rather than as inline `if`s means the table lives in one
+    /// place, so `set_status` and any future consumer cannot drift apart.
+    #[inline]
+    pub fn can_transition_to(self, next: SubmissionStatus) -> bool {
+        matches!(
+            (self, next),
+            (SubmissionStatus::Pending, SubmissionStatus::Verified)
+                | (SubmissionStatus::Pending, SubmissionStatus::Rejected)
+        )
+    }
 }
 
-// ── Storage keys ──────────────────────────────────────────────────────────────
+// â”€â”€ Storage keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    /// `(country_iso, category, valid_from)` → [`PriceSubmission`].
+    /// `(country_iso, category, valid_from)` â†’ [`PriceSubmission`].
     ///
-    /// The storage key uses `valid_from` (the observation timestamp) to
-    /// match the pre-existing scheme and remain backward-compatible with
-    /// any index built on that triple.
+    /// `valid_from` is the observation timestamp; it is both the storage key
+    /// component and the start of the validity window.
     Price(Symbol, Symbol, u64),
 
-    /// `(country_iso, category)` → `Vec<u64>` of timestamps, in insertion
-    /// order.  Used by the historical view functions to enumerate records
-    /// without a full-storage scan.
+    /// `(country_iso, category)` â†’ `Vec<u64>` of observation timestamps, in
+    /// insertion order.
+    ///
+    /// Lets history queries enumerate records without a full-storage scan.
     SubmissionIndex(Symbol, Symbol),
+
+    /// `submitter` â†’ `Vec<SubmitterEntry>` for that submitter's records, in
+    /// insertion order.
+    ///
+    /// Appended at the same moment as [`DataKey::SubmissionIndex`], so the two
+    /// can never disagree about which records exist. See
+    /// [`PriceVault::get_submitter_history`] for why this exists.
+    SubmitterIndex(Address),
 }
 
-// ── Domain types ──────────────────────────────────────────────────────────────
+/// One of a submitter's records, addressed well enough to reload it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitterEntry {
+    /// Country the observation belongs to.
+    pub country_iso: Symbol,
+    /// Basket category.
+    pub category: Symbol,
+    /// Observation timestamp (the `valid_from` component of the `Price` key).
+    pub timestamp: u64,
+}
+
+/// One bounded page of a submitter's history.
+///
+/// The cursor is an **offset into an append-only index**, which is what makes
+/// pagination stable: appending new records never shifts the position of an
+/// existing one, so a caller holding `next_cursor` can resume after a gap
+/// without having seen any record twice or skipped one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    /// The records in this page, in insertion order.
+    pub submissions: Vec<PriceSubmission>,
+    /// Cursor to pass to fetch the page after this one. Equal to the number of
+    /// index entries consumed so far.
+    pub next_cursor: u32,
+    /// Whether any entry remains after this page.
+    pub has_more: bool,
+}
+
+// â”€â”€ Domain types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A single raw price submission with an attached validity window.
 ///
-/// The window `[valid_from, valid_until)` defines the interval during which
-/// this submission is considered a fresh price observation.  After
-/// `valid_until` the record remains in persistent storage (for historical
-/// audit) but is excluded from any live aggregation.
-/// A single raw price submission.
+/// The window `[valid_from, valid_until)` bounds the interval during which the
+/// record is a fresh observation. After `valid_until` the record stays in
+/// storage for historical audit but is excluded from live aggregation.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceSubmission {
     /// The submitting oracle/operator address.
     pub submitter: Address,
-    /// ISO country code (topic-style, kept readable for indexing).
+    /// ISO country code, kept readable for indexing.
     pub country_iso: Symbol,
-    /// The price category, e.g. `bread` or `rent`.
+    /// The price category, e.g. `Food` or `Rent`.
     pub category: Symbol,
-    /// Unverified raw price in the smallest fixed-point unit.
-    ///
-    /// Validated by [`guards::require_positive_price`]: must be `> 0`.
+    /// Raw price in the smallest fixed-point unit. Must be `> 0`.
     pub value: i128,
-    /// The ledger timestamp at which this observation was made.
-    ///
-    /// Also the start of the validity window and the storage key component.
+    /// Start of the validity window; also the storage key component.
     pub valid_from: u64,
-    /// The ledger timestamp after which this observation is considered stale
-    /// (`valid_from + validity_window_secs`, exclusive upper bound).
-    ///
-    /// Once the current ledger timestamp reaches or exceeds `valid_until`,
-    /// `is_valid_at` returns `false` and `get_valid` returns `None`.
+    /// Exclusive expiry timestamp (`valid_from + validity_window_secs`).
     pub valid_until: u64,
-    /// Native timestamp of the observation.
-    ///
-    /// Validated by [`guards::require_positive_u64`]: must be `> 0`.
+    /// Observation timestamp. Mirrors `valid_from`.
     pub timestamp: u64,
-    /// Current lifecycle state of this submission.
-    ///
-    /// Set to [`SubmissionStatus::Pending`] at creation.  Transitions to
-    /// [`SubmissionStatus::Verified`] or [`SubmissionStatus::Rejected`] via
-    /// [`PriceVault::set_status`].  Both non-`Pending` states are terminal.
+    /// Current lifecycle state. `Pending` at creation.
     pub status: SubmissionStatus,
 }
 
 impl PriceSubmission {
-    /// Returns `true` iff `query_ts` falls within `[valid_from, valid_until)`.
+    /// Whether `query_ts` falls within `[valid_from, valid_until)`.
     ///
-    /// The lower bound is inclusive (a submission is immediately valid at the
-    /// moment it is observed).  The upper bound is exclusive so consecutive
-    /// non-overlapping windows share no ambiguous boundary.
+    /// Lower bound inclusive, upper bound exclusive, so consecutive
+    /// non-overlapping windows never both claim a timestamp.
     #[inline]
     pub fn is_valid_at(&self, query_ts: u64) -> bool {
         query_ts >= self.valid_from && query_ts < self.valid_until
     }
 }
 
-// ── Events ────────────────────────────────────────────────────────────────────
+// â”€â”€ Events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Emitted when a price submission is successfully recorded (issue #694).
+/// Emitted after a price submission is recorded.
 ///
-/// `country_iso` and `category` are topics — the two dimensions an indexer
-/// filters on — so a consumer can subscribe to just the submissions it cares
-/// about without decoding every event body. The body carries the rest of the
-/// submission metadata (submitter, value, validity window, initial status and
-/// schema version) so an indexer can build its record from the event alone.
+/// `country_iso` and `category` are **topics** â€” the two dimensions an indexer
+/// filters on â€” so a consumer can subscribe to just the submissions it cares
+/// about without decoding every body. The body carries the rest of the
+/// metadata so an indexer can build its record from the event alone.
 ///
-/// Emitted only after both the record and its history-index entry have been
-/// written, so a consumer that reacts to the event can read the submission back
-/// immediately. A replayed submission that is a no-op emits nothing.
+/// Emitted only after both the record and its index entry are written, so a
+/// consumer reacting to the event can read the submission back immediately. A
+/// replayed submission is a no-op and emits nothing.
 #[contractevent]
 #[derive(Clone)]
 pub struct PriceSubmitted {
+    /// Topic â€” the country this observation belongs to.
     #[topic]
     pub country_iso: Symbol,
-
+    /// Topic â€” the basket category.
     #[topic]
     pub category: Symbol,
-
+    /// The submitting oracle/operator.
     pub submitter: Address,
+    /// Raw price value.
     pub value: i128,
+    /// Start of the validity window.
     pub valid_from: u64,
+    /// Exclusive expiry timestamp.
     pub valid_until: u64,
+    /// Status at creation, always `Pending`.
     pub status: SubmissionStatus,
+    /// Schema version the record was written under.
     pub schema_version: u32,
 }
 
-// ── Contract ──────────────────────────────────────────────────────────────────
+/// Emitted after a submission's status changes.
+///
+/// # What an indexer needs
+///
+/// A consumer that tracks verification state has to know *which* record moved,
+/// *from where* it moved, and *who* was authorised to move it. All three are in
+/// this event: the record is addressed by `country_iso` (topic), `category`
+/// (topic) and `timestamp`; `prior_status` and `new_status` give the
+/// transition; `actor` is the address whose `require_auth` authorised it.
+///
+/// Without `prior_status` an indexer can only report the new state and cannot
+/// distinguish a `Verified` record from one that was already `Verified`. Without
+/// `actor` it cannot attribute the change to a verifier at all â€” which is the
+/// part an audit actually needs.
+///
+/// Published only after the record has been written, so a consumer reacting to
+/// the event can read the new status back immediately. A refused transition
+/// emits nothing.
+#[contractevent]
+#[derive(Clone)]
+pub struct StatusChanged {
+    /// Topic â€” the country this record belongs to.
+    #[topic]
+    pub country_iso: Symbol,
+    /// Topic â€” the basket category.
+    #[topic]
+    pub category: Symbol,
+    /// Observation timestamp: the third component of the record's key.
+    pub timestamp: u64,
+    /// The address whose authorisation allowed the transition.
+    pub actor: Address,
+    /// Status the record held before this change.
+    pub prior_status: SubmissionStatus,
+    /// Status the record holds after this change.
+    pub new_status: SubmissionStatus,
+}
+
+// â”€â”€ Contract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[contract]
 pub struct PriceVault;
 
 #[contractimpl]
 impl PriceVault {
-    // ── Mutating entry points ─────────────────────────────────────────────
+    // â”€â”€ Mutating entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Record a raw price submission with an explicit validity window.
+    /// # Record a raw price submission
     ///
-    /// `valid_from` is the observation timestamp (storage key component).
-    /// `validity_window_secs` defines how long the submission is considered
-    /// fresh.  [`DEFAULT_VALIDITY_WINDOW_SECS`] (86 400 s) is recommended
-    /// for daily basket observations.
+    /// `valid_from` is the observation timestamp (and the storage key
+    /// component). `validity_window_secs` is how long the submission stays
+    /// fresh; [`DEFAULT_VALIDITY_WINDOW_SECS`] (86 400 s) suits daily basket
+    /// observations.
     ///
-    /// # Errors
-    /// * [`Error::InvalidTimestamp`] — `valid_from` is zero.
-    /// * [`Error::InvalidWindow`] — `validity_window_secs` is zero, or
-    ///   `valid_from + validity_window_secs` overflows `u64`.
-    /// Record a raw price submission with an initial status of `Pending`.
-    /// Record a raw price submission.
-    ///
-    /// The payload is validated against [`SUBMIT_SCHEMA`] before `require_auth`
-    /// and before any storage access.  Invalid payloads are rejected at the
-    /// gate with a specific error code — no auth side-effects, no partial
-    /// writes.
+    /// Validation order is fixed and every step before auth is a pure
+    /// predicate â€” see the module docs. If a record already exists for the same
+    /// `(country_iso, category, valid_from)` triple the call is a **no-op**:
+    /// the original is kept and the index is not duplicated, so replaying a
+    /// transaction can never corrupt the historical index.
     ///
     /// # Errors
-    /// * [`Error::ZeroNotAllowed`] — `timestamp` or `value` is zero.
-    /// * [`Error::NegativeNotAllowed`] — `value` is negative.
-    /// * [`Error::ValueAboveMaximum`] — `value` exceeds the schema ceiling.
-    /// * [`Error::EmptySymbol`] — `country_iso` or `category` is empty.
-    /// * [`Error::SchemaMismatch`] — caller's schema version ≠ 1.
-    /// # Validation (issue #728)
-    /// All numeric inputs are validated through the [`guards`] module:
-    /// - `value` must be strictly positive (`> 0`).
-    /// - `timestamp` must be strictly positive (`> 0`).
-    ///
-    /// # Errors
-    /// * [`Error::InvalidTimestamp`] — `timestamp` is zero.
-    /// * [`Error::ZeroPrice`] — `value` is zero.
-    /// * [`Error::NegativePrice`] — `value` is negative.
-    /// If a submission already exists for the same `(country_iso, category,
-    /// timestamp)` triple the call is a no-op: the existing record is kept
-    /// and the timestamp index is not duplicated.  This guarantees that
-    /// replaying the same transaction never corrupts the historical index.
-    ///
-    /// # Errors
-    /// * [`Error::InvalidTimestamp`] — `timestamp` is zero.
+    /// * [`Error::InvalidCountry`] â€” country is not a registry identifier.
+    /// * [`Error::InvalidCategory`] â€” category is not a registry identifier.
+    /// * [`Error::ZeroNotAllowed`] â€” `valid_from` or `value` is zero.
+    /// * [`Error::NegativeNotAllowed`] â€” `value` is negative.
+    /// * [`Error::ValueAboveMaximum`] â€” `value` exceeds [`MAX_PRICE`].
+    /// * [`Error::EmptySymbol`] â€” country or category is empty.
+    /// * [`Error::SchemaMismatch`] â€” caller expects another schema version.
+    /// * [`Error::InvalidWindow`] â€” zero window, or `valid_from + window`
+    ///   overflows `u64`.
     pub fn submit(
         env: Env,
         submitter: Address,
@@ -818,25 +676,7 @@ impl PriceVault {
         valid_from: u64,
         validity_window_secs: u64,
     ) -> Result<(), Error> {
-        // Keep the legacy observation timestamp aligned with the key value.
-        let timestamp = valid_from;
-
-        // Schema validation runs before require_auth so malformed payloads
-        // are rejected without touching the auth subsystem.
-        payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country_iso,
-                category: &category,
-                value,
-                timestamp,
-                schema_version: SCHEMA_VERSION,
-            },
-        )?;
-
-        // Identifier registry: country and category must be supported
-        // identifiers, not arbitrary symbols. Checked alongside the payload
-        // schema, before auth and before any storage access.
+        // 1. Identifier registry â€” pure, before auth and before storage.
         if !registry::is_supported_country(&env, &country_iso) {
             return Err(Error::InvalidCountry);
         }
@@ -844,15 +684,24 @@ impl PriceVault {
             return Err(Error::InvalidCategory);
         }
 
-        // Validate timestamp first (pre-existing check).
-        if timestamp == 0 {
-            return Err(Error::InvalidTimestamp);
-        }
-        // Fail-safe: reject zero or negative price values (issue #728).
+        // 2. Payload schema â€” pure, before auth and before storage.
+        payload::validate(
+            SUBMIT_SCHEMA,
+            &payload::SubmitPayload {
+                country_iso: &country_iso,
+                category: &category,
+                value,
+                timestamp: valid_from,
+                schema_version: SCHEMA_VERSION,
+            },
+        )?;
+
+        // 3. Guards â€” defence in depth for the price itself.
         guards::require_positive_price(value)?;
-        if valid_from == 0 {
-            return Err(Error::InvalidTimestamp);
-        }
+
+        // Validity window. Zero or overflowing windows are rejected rather
+        // than clamped: a clamped window would silently disagree with the
+        // submitter's intent about how fresh the observation is.
         if validity_window_secs == 0 {
             return Err(Error::InvalidWindow);
         }
@@ -860,11 +709,12 @@ impl PriceVault {
             .checked_add(validity_window_secs)
             .ok_or(Error::InvalidWindow)?;
 
+        // Auth comes after every pure check.
         submitter.require_auth();
 
-        let key = DataKey::Price(country_iso.clone(), category.clone(), timestamp);
+        let key = DataKey::Price(country_iso.clone(), category.clone(), valid_from);
 
-        // Idempotent: if the record already exists, leave it untouched.
+        // Idempotent replay: keep the first write, emit nothing.
         if env.storage().persistent().has(&key) {
             return Ok(());
         }
@@ -878,26 +728,39 @@ impl PriceVault {
                 value,
                 valid_from,
                 valid_until,
-                timestamp,
-                status: SubmissionStatus::Pending, // always starts Pending
+                timestamp: valid_from,
+                status: SubmissionStatus::Pending,
             },
         );
 
-        // Append timestamp to the per-(country, category) index so that
-        // history queries do not need a full storage scan.
+        // Append to the per-(country, category) index so history queries need
+        // no full-storage scan.
         let idx_key = DataKey::SubmissionIndex(country_iso.clone(), category.clone());
         let mut index: Vec<u64> = env
             .storage()
             .persistent()
             .get(&idx_key)
             .unwrap_or_else(|| Vec::new(&env));
-        index.push_back(timestamp);
+        index.push_back(valid_from);
         env.storage().persistent().set(&idx_key, &index);
 
-        // Successful-submission event: emitted only after both the record and
-        // its index entry are stored, so a consumer that observes it can read
-        // the submission back immediately. The replay no-op above returns
-        // before this point, so duplicate attempts emit nothing.
+        // Append to the per-submitter index so a submitter's own history is
+        // reachable without scanning every (country, category) pair. Written in
+        // the same transaction as the record and the group index, so the three
+        // views cannot disagree about which records exist.
+        let sub_key = DataKey::SubmitterIndex(submitter.clone());
+        let mut sub_index: Vec<SubmitterEntry> = env
+            .storage()
+            .persistent()
+            .get(&sub_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        sub_index.push_back(SubmitterEntry {
+            country_iso: country_iso.clone(),
+            category: category.clone(),
+            timestamp: valid_from,
+        });
+        env.storage().persistent().set(&sub_key, &sub_index);
+
         PriceSubmitted {
             country_iso,
             category,
@@ -913,41 +776,18 @@ impl PriceVault {
         Ok(())
     }
 
-    // ── Identifier registry (issue #689) ────────────────────────────────
-
-    /// The supported ISO 3166-1 alpha-2 country codes.
-    pub fn supported_countries(env: Env) -> Vec<Symbol> {
-        registry::countries(&env)
-    }
-
-    /// The supported cost-of-living basket categories.
-    pub fn supported_categories(env: Env) -> Vec<Symbol> {
-        registry::categories(&env)
-    }
-
-    /// The identifier-registry version this build was compiled against.
-    pub fn registry_version(_env: Env) -> u32 {
-        registry::VERSION
-    }
-
-    // ── Read entry points ─────────────────────────────────────────────────
-
-    /// Read a stored price submission by its composite key, if present.
+    /// # Transition a submission's status
     ///
-    /// Returns the record regardless of whether it is currently within its
-    /// validity window.  Use [`Self::get_valid`] to gate on freshness.
-    /// Transition a submission's status from `Pending` to `Verified` or
-    /// `Rejected`.
+    /// Moves a `Pending` submission to `Verified` or `Rejected`. The transition
+    /// table is [`SubmissionStatus::can_transition_to`]: `Pending` is never a
+    /// target, and `Verified`/`Rejected` are absorbing.
     ///
-    /// Only an authorized `verifier` address may call this function.
-    /// The submission must currently be in the `Pending` state; any other
-    /// starting state, or setting the target back to `Pending`, returns
-    /// [`Error::InvalidTransition`].
+    /// The record is left byte-for-byte unchanged when a transition is refused.
     ///
     /// # Errors
-    /// * [`Error::NotFound`] — no submission exists for the given key.
-    /// * [`Error::InvalidTransition`] — the current status is already
-    ///   terminal (`Verified` or `Rejected`), or `new_status` is `Pending`.
+    /// * [`Error::NotFound`] â€” no submission for the given key.
+    /// * [`Error::InvalidTransition`] â€” `new_status` is `Pending`, or the
+    ///   current status is already terminal.
     pub fn set_status(
         env: Env,
         verifier: Address,
@@ -958,38 +798,44 @@ impl PriceVault {
     ) -> Result<(), Error> {
         verifier.require_auth();
 
-        // Disallow re-setting to Pending — Pending is only valid as the
-        // initial state assigned by submit().
-        if new_status == SubmissionStatus::Pending {
-            return Err(Error::InvalidTransition);
-        }
-
         let key = DataKey::Price(country_iso.clone(), category.clone(), timestamp);
-
         let mut submission: PriceSubmission = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::NotFound)?;
 
-        // Terminal states are irreversible.
-        if submission.status.is_terminal() {
+        // One table, consulted here and nowhere else.
+        if !submission.status.can_transition_to(new_status) {
             return Err(Error::InvalidTransition);
         }
 
+        let prior_status = submission.status;
         submission.status = new_status;
         env.storage().persistent().set(&key, &submission);
+
+        // Published after the write, so a consumer reacting to the event can
+        // read the new status back. A refused transition returns above and
+        // emits nothing.
+        StatusChanged {
+            country_iso,
+            category,
+            timestamp,
+            actor: verifier,
+            prior_status,
+            new_status,
+        }
+        .publish(&env);
 
         Ok(())
     }
 
-    // ── Read entry points ─────────────────────────────────────────────────
+    // â”€â”€ Read entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Read a stored price submission, if present.
-    // ── Point-in-time read ────────────────────────────────────────────────
-
-    /// Read a stored price submission by its exact composite key, if
-    /// present.
+    /// Read a stored submission by its exact composite key.
+    ///
+    /// Returns the record regardless of whether it is currently fresh â€” use
+    /// [`Self::get_valid`] to gate on the validity window.
     pub fn get(
         env: Env,
         country_iso: Symbol,
@@ -1001,16 +847,12 @@ impl PriceVault {
             .get(&DataKey::Price(country_iso, category, valid_from))
     }
 
-    /// Read a stored price submission only if it is still within its
-    /// validity window at `query_ts`.
+    /// Read a submission only if it is fresh at `query_ts`.
     ///
-    /// Returns `None` when:
-    /// - no submission exists for the given key, **or**
-    /// - the submission exists but `query_ts >= valid_until` (expired), **or**
-    /// - `query_ts < valid_from` (not yet valid).
-    ///
-    /// This is the recommended call for aggregation and index calculation
-    /// code that must exclude stale prices.
+    /// Returns `None` when the record is missing, expired
+    /// (`query_ts >= valid_until`), or not yet valid (`query_ts < valid_from`).
+    /// This is the recommended call for aggregation and index code, which must
+    /// exclude stale prices.
     pub fn get_valid(
         env: Env,
         country_iso: Symbol,
@@ -1022,7 +864,6 @@ impl PriceVault {
             .storage()
             .persistent()
             .get(&DataKey::Price(country_iso, category, valid_from))?;
-
         if submission.is_valid_at(query_ts) {
             Some(submission)
         } else {
@@ -1030,10 +871,10 @@ impl PriceVault {
         }
     }
 
-    /// Check whether a stored submission is valid at the given timestamp.
+    /// Whether a stored submission is fresh at `query_ts`.
     ///
-    /// Returns `false` for missing submissions (rather than an error) so
-    /// callers can use a simple boolean gate without matching on `Option`.
+    /// Returns `false` (not an error) for missing records so callers can use a
+    /// plain boolean gate without matching on `Option`.
     pub fn is_valid_at(
         env: Env,
         country_iso: Symbol,
@@ -1045,370 +886,15 @@ impl PriceVault {
             .storage()
             .persistent()
             .get(&DataKey::Price(country_iso, category, valid_from));
-
         match submission {
             Some(s) => s.is_valid_at(query_ts),
             None => false,
         }
     }
-}
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
-    fn make_env() -> Env {
-        Env::default()
-    }
-
-    fn deploy(env: &Env) -> PriceVaultClient {
-        let contract_id = env.register(PriceVault, ());
-        PriceVaultClient::new(env, &contract_id)
-    }
-
-    fn sym(env: &Env, s: &str) -> Symbol {
-        Symbol::new(env, s)
-    }
-
-    // ── submit validation ─────────────────────────────────────────────────
-
-    #[test]
-    fn submit_zero_valid_from_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &1000,
-                &0_u64,
-                &DEFAULT_VALIDITY_WINDOW_SECS,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTimestamp);
-    }
-
-    #[test]
-    fn submit_zero_window_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &1000,
-                &1000_u64,
-                &0_u64,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidWindow);
-    }
-
-    #[test]
-    fn submit_overflow_window_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &1000,
-                &u64::MAX,      // valid_from
-                &1_u64,         // valid_from + 1 overflows u64
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidWindow);
-    }
-
-    #[test]
-    fn submit_stores_correct_window_bounds() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &country, &category, &1000, &1_000_u64, &DEFAULT_VALIDITY_WINDOW_SECS)
-            .unwrap();
-
-        let s = client.get(&country, &category, &1_000_u64).unwrap();
-        assert_eq!(s.valid_from, 1_000);
-        assert_eq!(s.valid_until, 1_000 + DEFAULT_VALIDITY_WINDOW_SECS);
-    }
-
-    // ── is_valid_at (method on PriceSubmission) ───────────────────────────
-
-    #[test]
-    fn is_valid_at_true_at_lower_bound() {
-        let sub = PriceSubmission {
-            submitter: soroban_sdk::Address::from_str(
-                &Env::default(),
-                "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
-            ),
-            country_iso: Symbol::new(&Env::default(), "NG"),
-            category: Symbol::new(&Env::default(), "Food"),
-            value: 100,
-            valid_from: 1_000,
-            valid_until: 2_000,
-        };
-        assert!(sub.is_valid_at(1_000));
-    }
-
-    #[test]
-    fn is_valid_at_false_at_upper_bound_exclusive() {
-        let env = Env::default();
-        let sub = PriceSubmission {
-            submitter: Address::generate(&env),
-            country_iso: sym(&env, "NG"),
-            category: sym(&env, "Food"),
-            value: 100,
-            valid_from: 1_000,
-            valid_until: 2_000,
-        };
-        // Upper bound is exclusive.
-        assert!(!sub.is_valid_at(2_000));
-    }
-
-    #[test]
-    fn is_valid_at_false_before_window() {
-        let env = Env::default();
-        let sub = PriceSubmission {
-            submitter: Address::generate(&env),
-            country_iso: sym(&env, "NG"),
-            category: sym(&env, "Food"),
-            value: 100,
-            valid_from: 1_000,
-            valid_until: 2_000,
-        };
-        assert!(!sub.is_valid_at(999));
-    }
-
-    #[test]
-    fn is_valid_at_true_inside_window() {
-        let env = Env::default();
-        let sub = PriceSubmission {
-            submitter: Address::generate(&env),
-            country_iso: sym(&env, "NG"),
-            category: sym(&env, "Food"),
-            value: 100,
-            valid_from: 1_000,
-            valid_until: 2_000,
-        };
-        assert!(sub.is_valid_at(1_500));
-    }
-
-    // ── contract is_valid_at ──────────────────────────────────────────────
-
-    #[test]
-    fn contract_is_valid_at_false_for_missing() {
-        let env = make_env();
-        let client = deploy(&env);
-        let result =
-            client.is_valid_at(&sym(&env, "NG"), &sym(&env, "Food"), &1_000_u64, &1_000_u64);
-        assert!(!result);
-    }
-
-    #[test]
-    fn contract_is_valid_at_true_inside_window() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100,
-                &1_000_u64,
-                &86_400_u64,
-            )
-            .unwrap();
-
-        assert!(client.is_valid_at(&sym(&env, "NG"), &sym(&env, "Food"), &1_000_u64, &50_000_u64));
-    }
-
-    #[test]
-    fn contract_is_valid_at_false_after_expiry() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100,
-                &1_000_u64,
-                &3_600_u64, // 1 hour window
-            )
-            .unwrap();
-
-        // Query at valid_until (4600) — exclusive upper bound, so invalid.
-        assert!(!client.is_valid_at(
-            &sym(&env, "NG"),
-            &sym(&env, "Food"),
-            &1_000_u64,
-            &4_600_u64
-        ));
-    }
-
-    // ── get_valid ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn get_valid_returns_none_for_missing() {
-        let env = make_env();
-        let client = deploy(&env);
-        assert!(client
-            .get_valid(&sym(&env, "NG"), &sym(&env, "Food"), &1_u64, &1_u64)
-            .is_none());
-    }
-
-    #[test]
-    fn get_valid_returns_some_inside_window() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "KE"),
-                &sym(&env, "Rent"),
-                &500,
-                &2_000_u64,
-                &86_400_u64,
-            )
-            .unwrap();
-
-        let result = client.get_valid(
-            &sym(&env, "KE"),
-            &sym(&env, "Rent"),
-            &2_000_u64,
-            &2_000_u64,
-        );
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().value, 500);
-    }
-
-    #[test]
-    fn get_valid_returns_none_after_expiry() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "BR"),
-                &sym(&env, "Transport"),
-                &300,
-                &1_000_u64,
-                &3_600_u64, // expires at 4600
-            )
-            .unwrap();
-
-        // Query well past expiry.
-        let result = client.get_valid(
-            &sym(&env, "BR"),
-            &sym(&env, "Transport"),
-            &1_000_u64,
-            &100_000_u64,
-        );
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn get_valid_returns_none_before_valid_from() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "IN"),
-                &sym(&env, "Health"),
-                &200,
-                &5_000_u64,
-                &86_400_u64,
-            )
-            .unwrap();
-
-        // Query before the window starts.
-        let result = client.get_valid(
-            &sym(&env, "IN"),
-            &sym(&env, "Health"),
-            &5_000_u64,
-            &4_999_u64,
-        );
-        assert!(result.is_none());
-    }
-
-    // ── consecutive non-overlapping windows ───────────────────────────────
-
-    #[test]
-    fn consecutive_windows_do_not_overlap() {
-        // Window 1: [1000, 2000)
-        // Window 2: [2000, 3000)
-        // query_ts=2000 must match only window 2.
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        // Window 1
-        client
-            .submit(&submitter, &country, &category, &100, &1_000_u64, &1_000_u64)
-            .unwrap();
-        // Window 2
-        client
-            .submit(&submitter, &country, &category, &200, &2_000_u64, &1_000_u64)
-            .unwrap();
-
-        // At ts=2000: window 1 has expired (upper bound exclusive), window 2 is fresh.
-        assert!(!client.is_valid_at(&country, &category, &1_000_u64, &2_000_u64));
-        assert!(client.is_valid_at(&country, &category, &2_000_u64, &2_000_u64));
-    }
-
-    // ── default window constant ───────────────────────────────────────────
-
-    #[test]
-    fn default_validity_window_is_24_hours() {
-        assert_eq!(DEFAULT_VALIDITY_WINDOW_SECS, 86_400);
-    }
-
-    /// Read just the status of a stored submission, if present.
+    /// Read just the lifecycle state of a submission, if present.
     ///
-    /// Cheaper than `get` when the caller only needs the lifecycle state.
+    /// Cheaper than [`Self::get`] when the caller only needs the status.
     pub fn get_status(
         env: Env,
         country_iso: Symbol,
@@ -1420,26 +906,13 @@ mod tests {
             .persistent()
             .get(&DataKey::Price(country_iso, category, timestamp));
         submission.map(|s| s.status)
-    // ── Historical view functions (issue #743) ────────────────────────────
+    }
 
-    /// Return **all** stored submissions for a `(country_iso, category)`
-    /// pair, ordered by ascending `timestamp`.
+    /// All submissions for `(country_iso, category)`, in insertion order.
     ///
-    /// The output is fully deterministic: for any given contract state it
-    /// always returns the same ordered sequence.  When no submissions exist
-    /// the function returns an empty `Vec` — it never panics.
-    ///
-    /// Intended for auditing and off-chain analysis.  For large datasets
-    /// prefer [`Self::get_history_range`] to bound result size.
-    ///
-    /// # Acceptance criteria coverage
-    /// * ✅ Historical price submissions can be queried by relevant filters
-    ///   (`country_iso` + `category`).
-    /// * ✅ Record output includes enough metadata for auditing and analysis
-    ///   (full [`PriceSubmission`] struct including `submitter`, `value`, and
-    ///   `timestamp`).
-    /// * ✅ Query results remain deterministic for the same contract state
-    ///   (pure read, no state mutation).
+    /// Deterministic: identical contract state always produces an identical
+    /// sequence. Returns an empty `Vec` when there are none â€” never panics.
+    /// For bounded reads prefer [`Self::get_history_range`].
     pub fn get_history(
         env: Env,
         country_iso: Symbol,
@@ -1455,19 +928,11 @@ mod tests {
         Self::collect_submissions(&env, &country_iso, &category, &timestamps)
     }
 
-    /// Return all stored submissions for a `(country_iso, category)` pair
-    /// whose timestamp satisfies `from_ts <= timestamp <= to_ts`, ordered by
-    /// ascending `timestamp`.
+    /// Submissions whose timestamp satisfies `from_ts <= ts <= to_ts`, in
+    /// insertion order. Both bounds are inclusive.
     ///
     /// # Errors
-    /// * [`Error::InvalidRange`] — `from_ts > to_ts`.
-    ///
-    /// # Acceptance criteria coverage
-    /// * ✅ Historical price submissions can be queried by relevant filters
-    ///   (adds a `[from_ts, to_ts]` time-range filter on top of
-    ///   `country_iso` + `category`).
-    /// * ✅ Record output includes enough metadata for auditing and analysis.
-    /// * ✅ Query results remain deterministic for the same contract state.
+    /// * [`Error::InvalidRange`] â€” `from_ts > to_ts`.
     pub fn get_history_range(
         env: Env,
         country_iso: Symbol,
@@ -1486,7 +951,6 @@ mod tests {
             .get(&idx_key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // Filter to the requested time window.
         let mut filtered = Vec::new(&env);
         for ts in all_timestamps.iter() {
             if ts >= from_ts && ts <= to_ts {
@@ -1497,14 +961,8 @@ mod tests {
         Ok(Self::collect_submissions(&env, &country_iso, &category, &filtered))
     }
 
-    /// Return the **most recent** submission for a `(country_iso, category)`
-    /// pair — the entry with the highest `timestamp` — or `None` if none
-    /// exist.
-    ///
-    /// # Acceptance criteria coverage
-    /// * ✅ Historical price submissions can be queried by relevant filters.
-    /// * ✅ Record output includes enough metadata for auditing and analysis.
-    /// * ✅ Query results remain deterministic for the same contract state.
+    /// The most recently **inserted** submission for `(country_iso, category)`,
+    /// or `None` when there is none.
     pub fn get_latest(
         env: Env,
         country_iso: Symbol,
@@ -1517,20 +975,139 @@ mod tests {
             .get(&idx_key)
             .unwrap_or_else(|| Vec::new(&env));
 
-        // The index is append-only and in insertion order.  The last entry
-        // is the most recently submitted timestamp.
+        // The index is append-only and in insertion order, so the last entry is
+        // the most recently inserted timestamp.
         let latest_ts = timestamps.last()?;
-
         env.storage()
             .persistent()
             .get(&DataKey::Price(country_iso, category, latest_ts))
     }
 
-    // ── Internal helpers ──────────────────────────────────────────────────
+    /// # One bounded page of a submitter's records
+    ///
+    /// Returns at most [`MAX_HISTORY_PAGE_SIZE`] records starting at `cursor`
+    /// in [`DataKey::SubmitterIndex`].
+    ///
+    /// `cursor` is an **offset into an append-only index**, which is what makes
+    /// pagination stable: new submissions are appended, so an offset already
+    /// handed to a caller keeps pointing at the same position. A caller paging
+    /// through history therefore never sees a record twice and never skips one
+    /// just because another submission landed mid-pagination.
+    ///
+    /// An index entry whose record has since been removed is skipped rather
+    /// than failing the whole page.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidPageSize`] â€” `limit` is zero or above
+    ///   [`MAX_HISTORY_PAGE_SIZE`].
+    pub fn get_submitter_history(
+        env: Env,
+        submitter: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<HistoryPage, Error> {
+        if limit == 0 || limit > MAX_HISTORY_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
 
-    /// Load [`PriceSubmission`] records for each timestamp in `timestamps`,
-    /// skipping any that are not present in persistent storage (defensive —
-    /// under normal operation every indexed timestamp has a record).
+        let sub_key = DataKey::SubmitterIndex(submitter);
+        let entries: Vec<SubmitterEntry> = env
+            .storage()
+            .persistent()
+            .get(&sub_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = entries.len();
+        // A cursor past the end yields an empty final page rather than an
+        // error, so a caller that races a concurrent submission still
+        // terminates.
+        let start = if cursor > total { total } else { cursor };
+        let end = core::cmp::min(start.saturating_add(limit), total);
+
+        let mut submissions = Vec::new(&env);
+        for i in start..end {
+            let entry = entries.get(i).unwrap();
+            let key = DataKey::Price(
+                entry.country_iso.clone(),
+                entry.category.clone(),
+                entry.timestamp,
+            );
+            if let Some(submission) = env.storage().persistent().get::<DataKey, PriceSubmission>(&key)
+            {
+                submissions.push_back(submission);
+            }
+        }
+
+        Ok(HistoryPage {
+            submissions,
+            next_cursor: end,
+            has_more: end < total,
+        })
+    }
+
+    // â”€â”€ Registry views â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// The supported ISO 3166-1 alpha-2 country codes.
+    pub fn supported_countries(env: Env) -> Vec<Symbol> {
+        registry::countries(&env)
+    }
+
+    /// The supported cost-of-living basket categories.
+    pub fn supported_categories(env: Env) -> Vec<Symbol> {
+        registry::categories(&env)
+    }
+
+    /// The registry version this build was compiled against.
+    pub fn registry_version(_env: Env) -> u32 {
+        registry::VERSION
+    }
+
+    // â”€â”€ Pure helpers, callable off-chain â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Add two `i128` values, failing safely on overflow.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflow`] â€” result would overflow `i128`.
+    pub fn safe_add(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
+        guards::checked_add_i128(a, b)
+    }
+
+    /// Multiply two `i128` values, failing safely on overflow.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflowMul`] â€” result would overflow `i128`.
+    pub fn safe_mul(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
+        guards::checked_mul_i128(a, b)
+    }
+
+    /// Validate a submit payload without committing any state.
+    ///
+    /// Lets SDK clients and cross-contract callers confirm a payload is
+    /// structurally sound before building or forwarding a transaction.
+    pub fn validate_submit_payload(
+        _env: Env,
+        country_iso: Symbol,
+        category: Symbol,
+        value: i128,
+        timestamp: u64,
+    ) -> Result<(), Error> {
+        payload::validate(
+            SUBMIT_SCHEMA,
+            &payload::SubmitPayload {
+                country_iso: &country_iso,
+                category: &category,
+                value,
+                timestamp,
+                schema_version: SCHEMA_VERSION,
+            },
+        )
+    }
+
+    // â”€â”€ Internal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Load records for each timestamp in `timestamps`, skipping any that are
+    /// absent (defensive â€” under normal operation every indexed timestamp has
+    /// a record).
     fn collect_submissions(
         env: &Env,
         country_iso: &Symbol,
@@ -1549,7 +1126,7 @@ mod tests {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
@@ -1569,317 +1146,600 @@ mod tests {
         Symbol::new(env, s)
     }
 
-    // ── SubmissionStatus helper ───────────────────────────────────────────
+    /// Submit with the default validity window.
+    fn submit_ok(
+        client: &PriceVaultClient,
+        submitter: &Address,
+        country: &Symbol,
+        category: &Symbol,
+        value: i128,
+        valid_from: u64,
+    ) {
+        client
+            .submit(
+                submitter,
+                country,
+                category,
+                &value,
+                &valid_from,
+                &DEFAULT_VALIDITY_WINDOW_SECS,
+            )
+            .unwrap();
+    }
+
+    // â”€â”€ guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
-    fn pending_is_not_terminal() {
+    fn guard_price_bounds() {
+        assert_eq!(guards::require_positive_price(0), Err(Error::ZeroPrice));
+        assert_eq!(
+            guards::require_positive_price(-1),
+            Err(Error::NegativePrice)
+        );
+        assert_eq!(
+            guards::require_positive_price(i128::MIN),
+            Err(Error::NegativePrice)
+        );
+        assert!(guards::require_positive_price(1).is_ok());
+        assert!(guards::require_positive_price(i128::MAX).is_ok());
+    }
+
+    #[test]
+    fn guard_u64_and_i128_bounds() {
+        assert_eq!(guards::require_positive_u64(0), Err(Error::ZeroValue));
+        assert!(guards::require_positive_u64(1).is_ok());
+
+        assert_eq!(
+            guards::require_positive_i128(0),
+            Err(Error::NonPositiveAmount)
+        );
+        assert_eq!(
+            guards::require_positive_i128(-1),
+            Err(Error::NonPositiveAmount)
+        );
+        assert!(guards::require_positive_i128(1).is_ok());
+    }
+
+    #[test]
+    fn guard_checked_arithmetic() {
+        assert_eq!(guards::checked_add_u64(100, 200), Ok(300));
+        assert_eq!(guards::checked_add_u64(u64::MAX, 0), Ok(u64::MAX));
+        assert_eq!(
+            guards::checked_add_u64(u64::MAX, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        assert_eq!(guards::checked_add_i128(50, 50), Ok(100));
+        assert_eq!(
+            guards::checked_add_i128(i128::MAX, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+        assert_eq!(
+            guards::checked_add_i128(i128::MIN, -1),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        assert_eq!(guards::checked_mul_i128(3, 4), Ok(12));
+        assert_eq!(
+            guards::checked_mul_i128(i128::MAX, 2),
+            Err(Error::ArithmeticOverflowMul)
+        );
+        assert_eq!(
+            guards::checked_mul_i128(i128::MIN, -1),
+            Err(Error::ArithmeticOverflowMul)
+        );
+    }
+
+    // â”€â”€ payload validate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    fn payload<'a>(
+        country: &'a Symbol,
+        category: &'a Symbol,
+        value: i128,
+        timestamp: u64,
+    ) -> payload::SubmitPayload<'a> {
+        payload::SubmitPayload {
+            country_iso: country,
+            category,
+            value,
+            timestamp,
+            schema_version: SCHEMA_VERSION,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        let env = make_env();
+        let ng = sym(&env, "NG");
+        let food = sym(&env, "Food");
+        let empty = sym(&env, "");
+
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 0, 1)),
+            Err(Error::ZeroNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, -1, 1)),
+            Err(Error::NegativeNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 100, 0)),
+            Err(Error::ZeroNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, MAX_PRICE + 1, 1)),
+            Err(Error::ValueAboveMaximum)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&empty, &food, 100, 1)),
+            Err(Error::EmptySymbol)
+        );
+        assert!(payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 100, 1)).is_ok());
+        assert!(payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, MAX_PRICE, 1)).is_ok());
+    }
+
+    // â”€â”€ registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn registry_recognises_known_identifiers() {
+        let env = make_env();
+        assert!(registry::is_supported_country(&env, &sym(&env, "NG")));
+        assert!(registry::is_supported_country(&env, &sym(&env, "US")));
+        assert!(!registry::is_supported_country(&env, &sym(&env, "ZZ")));
+        assert!(registry::is_supported_category(&env, &sym(&env, "Food")));
+        assert!(!registry::is_supported_category(&env, &sym(&env, "Weapons")));
+        assert_eq!(registry::countries(&env).len(), registry::COUNTRY_CODES.len());
+        assert_eq!(registry::categories(&env).len(), registry::CATEGORIES.len());
+    }
+
+    // â”€â”€ submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn submit_stores_window_bounds_and_pending_status() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+
+        env.mock_all_auths();
+        submit_ok(&client, &submitter, &country, &category, 1_000, 1_000);
+
+        let s = client.get(&country, &category, &1_000).unwrap();
+        assert_eq!(s.valid_from, 1_000);
+        assert_eq!(s.valid_until, 1_000 + DEFAULT_VALIDITY_WINDOW_SECS);
+        assert_eq!(s.timestamp, 1_000);
+        assert_eq!(s.value, 1_000);
+        assert_eq!(s.submitter, submitter);
+        assert_eq!(s.status, SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn submit_rejects_unknown_identifiers() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "ZZ"),
+                    &sym(&env, "Food"),
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCountry
+        );
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Weapons"),
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+    }
+
+    #[test]
+    fn submit_rejects_bad_values_before_auth() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Zero price.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &0,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ZeroNotAllowed
+        );
+        // Negative price.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &-1,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::NegativeNotAllowed
+        );
+        // Zero timestamp.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &100,
+                    &0_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ZeroNotAllowed
+        );
+        // Above the schema ceiling.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &(MAX_PRICE + 1),
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ValueAboveMaximum
+        );
+    }
+
+    #[test]
+    fn submit_rejects_bad_windows() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Zero window.
+        assert_eq!(
+            client
+                .try_submit(&submitter, &country, &category, &100, &1_000_u64, &0_u64)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidWindow
+        );
+        // valid_from + window overflows u64.
+        assert_eq!(
+            client
+                .try_submit(&submitter, &country, &category, &100, &u64::MAX, &1_u64)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidWindow
+        );
+    }
+
+    #[test]
+    fn resubmitting_the_same_key_is_a_no_op() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 999, 10);
+
+        let history = client.get_history(&country, &category);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().value, 100);
+    }
+
+    // â”€â”€ validity window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn validity_window_bounds_are_half_open() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 100, 1_000);
+
+        // Lower bound inclusive.
+        assert!(client.is_valid_at(&country, &category, &1_000, &1_000));
+        // Interior.
+        assert!(client.is_valid_at(
+            &country,
+            &category,
+            &1_000,
+            &1_000 + DEFAULT_VALIDITY_WINDOW_SECS - 1
+        ));
+        // Upper bound exclusive.
+        assert!(!client.is_valid_at(
+            &country,
+            &category,
+            &1_000,
+            &1_000 + DEFAULT_VALIDITY_WINDOW_SECS
+        ));
+        // Before the window.
+        assert!(!client.is_valid_at(&country, &category, &1_000, &999));
+    }
+
+    #[test]
+    fn consecutive_windows_do_not_overlap() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Window 1 = [1_000, 2_000), window 2 = [2_000, 3_000).
+        client
+            .submit(&submitter, &country, &category, &100, &1_000_u64, &1_000_u64)
+            .unwrap();
+        client
+            .submit(&submitter, &country, &category, &200, &2_000_u64, &1_000_u64)
+            .unwrap();
+
+        // At 2_000 only window 2 is fresh.
+        assert!(!client.is_valid_at(&country, &category, &1_000, &2_000));
+        assert!(client.is_valid_at(&country, &category, &2_000, &2_000));
+    }
+
+    #[test]
+    fn get_valid_gates_on_freshness() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "KE");
+        let category = sym(&env, "Rent");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 500, 2_000);
+
+        assert!(client
+            .get_valid(&country, &category, &2_000, &2_000)
+            .is_some());
+        assert!(client
+            .get_valid(&country, &category, &2_000, &1_999)
+            .is_none());
+        assert!(client
+            .get_valid(&country, &category, &2_000, &100_000)
+            .is_none());
+        // Missing record.
+        assert!(client.get_valid(&country, &category, &9_999, &1).is_none());
+    }
+
+    #[test]
+    fn is_valid_at_is_false_for_missing_records() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert!(!client.is_valid_at(&sym(&env, "NG"), &sym(&env, "Food"), &1, &1));
+    }
+
+    // â”€â”€ status machine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn transition_table_allows_only_pending_to_a_terminal_state() {
+        // Pending may reach either terminal state.
+        assert!(SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Verified));
+        assert!(SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Rejected));
+        // Pending is never a target.
+        assert!(!SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Pending));
+        // Terminal states are absorbing.
+        assert!(!SubmissionStatus::Verified.can_transition_to(SubmissionStatus::Rejected));
+        assert!(!SubmissionStatus::Verified.can_transition_to(SubmissionStatus::Pending));
+        assert!(!SubmissionStatus::Rejected.can_transition_to(SubmissionStatus::Verified));
+        assert!(!SubmissionStatus::Rejected.can_transition_to(SubmissionStatus::Pending));
+
         assert!(!SubmissionStatus::Pending.is_terminal());
-    }
-
-    #[test]
-    fn verified_is_terminal() {
         assert!(SubmissionStatus::Verified.is_terminal());
-    }
-
-    #[test]
-    fn rejected_is_terminal() {
         assert!(SubmissionStatus::Rejected.is_terminal());
     }
 
-    // ── submit ────────────────────────────────────────────────────────────
+    #[test]
+    fn status_discriminants_are_stable() {
+        // Pinned so external consumers can match on the u32 representation.
+        assert_eq!(SubmissionStatus::Pending as u32, 0);
+        assert_eq!(SubmissionStatus::Verified as u32, 1);
+        assert_eq!(SubmissionStatus::Rejected as u32, 2);
+    }
 
     #[test]
-    fn submit_records_pending_status() {
+    fn pending_transitions_to_verified_and_rejected() {
+        for target in [SubmissionStatus::Verified, SubmissionStatus::Rejected] {
+            let env = make_env();
+            let client = deploy(&env);
+            let submitter = Address::generate(&env);
+            let verifier = Address::generate(&env);
+            let country = sym(&env, "NG");
+            let category = sym(&env, "Food");
+            env.mock_all_auths();
+
+            submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+            client
+                .set_status(&verifier, &country, &category, &100, &target)
+                .unwrap();
+            assert_eq!(client.get_status(&country, &category, &100), Some(target));
+        }
+    }
+
+    #[test]
+    fn terminal_states_reject_further_transitions() {
+        for terminal in [SubmissionStatus::Verified, SubmissionStatus::Rejected] {
+            for next in [
+                SubmissionStatus::Verified,
+                SubmissionStatus::Rejected,
+                SubmissionStatus::Pending,
+            ] {
+                let env = make_env();
+                let client = deploy(&env);
+                let submitter = Address::generate(&env);
+                let verifier = Address::generate(&env);
+                let country = sym(&env, "NG");
+                let category = sym(&env, "Food");
+                env.mock_all_auths();
+
+                submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+                client
+                    .set_status(&verifier, &country, &category, &100, &terminal)
+                    .unwrap();
+
+                assert_eq!(
+                    client
+                        .try_set_status(&verifier, &country, &category, &100, &next)
+                        .unwrap_err()
+                        .unwrap(),
+                    Error::InvalidTransition,
+                    "{terminal:?} -> {next:?} must be refused"
+                );
+                // The record is unchanged.
+                assert_eq!(
+                    client.get_status(&country, &category, &100),
+                    Some(terminal)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_is_not_a_valid_target() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
-
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
         env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
 
-        let submission = client
-            .get(&sym(&env, "NG"), &sym(&env, "Food"), &100_u64)
-            .unwrap();
-        assert_eq!(submission.status, SubmissionStatus::Pending);
-    // ── submit / get (existing surface) ──────────────────────────────────
+        submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+        assert_eq!(
+            client
+                .try_set_status(
+                    &verifier,
+                    &country,
+                    &category,
+                    &100,
+                    &SubmissionStatus::Pending,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidTransition
+        );
+    }
 
     #[test]
-    fn submit_and_get_round_trips() {
+    fn set_status_on_missing_record_is_not_found() {
+        let env = make_env();
+        let client = deploy(&env);
+        let verifier = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_set_status(
+                    &verifier,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Food"),
+                    &999,
+                    &SubmissionStatus::Verified,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::NotFound
+        );
+    }
+
+    #[test]
+    fn status_round_trips_inside_the_record() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "IN");
+        let category = sym(&env, "Health");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 300, 75);
+        assert_eq!(
+            client.get(&country, &category, &75).unwrap().status,
+            SubmissionStatus::Pending
+        );
+
+        client
+            .set_status(
+                &verifier,
+                &country,
+                &category,
+                &75,
+                &SubmissionStatus::Rejected,
+            )
+            .unwrap();
+
+        let after = client.get(&country, &category, &75).unwrap();
+        assert_eq!(after.status, SubmissionStatus::Rejected);
+        // Other fields are untouched by a status change.
+        assert_eq!(after.value, 300);
+        assert_eq!(after.submitter, submitter);
+    }
+
+    // â”€â”€ history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn history_is_empty_when_there_are_no_submissions() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert_eq!(client.get_history(&sym(&env, "NG"), &sym(&env, "Food")).len(), 0);
+        assert!(client.get_latest(&sym(&env, "NG"), &sym(&env, "Food")).is_none());
+    }
+
+    #[test]
+    fn history_returns_submissions_in_insertion_order() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
         let country = sym(&env, "NG");
         let category = sym(&env, "Food");
-
         env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &1_000, &100_u64).unwrap();
-        let got = client.get(&country, &category, &100_u64).unwrap();
 
-        assert_eq!(got.value, 1_000);
-        assert_eq!(got.timestamp, 100);
-    }
-
-    #[test]
-    fn submit_zero_timestamp_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &500, &0_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTimestamp);
-    }
-
-    // ── set_status — normal transitions ──────────────────────────────────
-
-    #[test]
-    fn pending_transitions_to_verified() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
-        client
-            .set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Verified,
-            )
-            .unwrap();
-
-        assert_eq!(
-            client.get_status(&sym(&env, "NG"), &sym(&env, "Food"), &100_u64),
-            Some(SubmissionStatus::Verified)
-        );
-    }
-
-    #[test]
-    fn pending_transitions_to_rejected() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "KE"), &sym(&env, "Rent"), &500, &200_u64)
-            .unwrap();
-        client
-            .set_status(
-                &verifier,
-                &sym(&env, "KE"),
-                &sym(&env, "Rent"),
-                &200_u64,
-                &SubmissionStatus::Rejected,
-            )
-            .unwrap();
-
-        assert_eq!(
-            client.get_status(&sym(&env, "KE"), &sym(&env, "Rent"), &200_u64),
-            Some(SubmissionStatus::Rejected)
-        );
-    }
-
-    // ── set_status — invalid transitions ─────────────────────────────────
-
-    #[test]
-    fn verified_cannot_transition_to_rejected() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
-        client
-            .set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Verified,
-            )
-            .unwrap();
-
-        let err = client
-            .try_set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Rejected,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTransition);
-    }
-
-    #[test]
-    fn rejected_cannot_transition_to_verified() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
-        client
-            .set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Rejected,
-            )
-            .unwrap();
-
-        let err = client
-            .try_set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Verified,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTransition);
-    }
-
-    #[test]
-    fn verified_cannot_transition_back_to_pending() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
-        client
-            .set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Verified,
-            )
-            .unwrap();
-
-        let err = client
-            .try_set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Pending,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTransition);
-    }
-
-    #[test]
-    fn cannot_set_status_to_pending_directly() {
-        // Attempting to use set_status to reach Pending (even for a
-        // Pending submission) is rejected, as Pending is only the
-        // initial state assigned by submit().
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1000, &100_u64)
-            .unwrap();
-
-        let err = client
-            .try_set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &100_u64,
-                &SubmissionStatus::Pending,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidTransition);
-    }
-
-    #[test]
-    fn set_status_missing_submission_returns_not_found() {
-        let env = make_env();
-        let client = deploy(&env);
-        let verifier = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_set_status(
-                &verifier,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &999_u64,
-                &SubmissionStatus::Verified,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::NotFound);
-    }
-
-    // ── get_status ────────────────────────────────────────────────────────
-
-    #[test]
-    fn get_status_returns_none_for_missing_submission() {
-        let env = make_env();
-        let client = deploy(&env);
-        let result = client.get_status(&sym(&env, "NG"), &sym(&env, "Food"), &1_u64);
-    #[test]
-    fn get_missing_returns_none() {
-        let env = make_env();
-        let client = deploy(&env);
-        let result = client.get(&sym(&env, "NG"), &sym(&env, "Food"), &99_u64);
-        assert!(result.is_none());
-    }
-
-    // ── get_history ───────────────────────────────────────────────────────
-
-    #[test]
-    fn get_history_empty_when_no_submissions() {
-        let env = make_env();
-        let client = deploy(&env);
-        let history = client.get_history(&sym(&env, "NG"), &sym(&env, "Food"));
-        assert_eq!(history.len(), 0);
-    }
-
-    #[test]
-    fn get_history_returns_all_submissions_in_insertion_order() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &100, &10_u64).unwrap();
-        client.submit(&submitter, &country, &category, &200, &20_u64).unwrap();
-        client.submit(&submitter, &country, &category, &300, &30_u64).unwrap();
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 200, 20);
+        submit_ok(&client, &submitter, &country, &category, 300, 30);
 
         let history = client.get_history(&country, &category);
         assert_eq!(history.len(), 3);
@@ -1889,983 +1749,298 @@ mod tests {
     }
 
     #[test]
-    fn get_history_is_scoped_to_country_and_category() {
+    fn history_is_scoped_per_country_and_category() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
-
         env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &100, &10_u64)
-            .unwrap();
-        client
-            .submit(&submitter, &sym(&env, "KE"), &sym(&env, "Food"), &200, &20_u64)
-            .unwrap();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Rent"), &300, &30_u64)
-            .unwrap();
 
-        // Only NG/Food — 1 record.
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        submit_ok(&client, &submitter, &sym(&env, "KE"), &sym(&env, "Food"), 200, 20);
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Rent"), 300, 30);
+
         let ng_food = client.get_history(&sym(&env, "NG"), &sym(&env, "Food"));
         assert_eq!(ng_food.len(), 1);
         assert_eq!(ng_food.get(0).unwrap().value, 100);
 
-        // Only KE/Food — 1 record.
         let ke_food = client.get_history(&sym(&env, "KE"), &sym(&env, "Food"));
         assert_eq!(ke_food.len(), 1);
         assert_eq!(ke_food.get(0).unwrap().value, 200);
 
-        // Only NG/Rent — 1 record.
         let ng_rent = client.get_history(&sym(&env, "NG"), &sym(&env, "Rent"));
         assert_eq!(ng_rent.len(), 1);
         assert_eq!(ng_rent.get(0).unwrap().value, 300);
     }
 
     #[test]
-    fn get_history_idempotent_resubmit_not_duplicated() {
-        // Submitting at the same timestamp twice must not double the index.
+    fn history_carries_full_audit_metadata() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
         let country = sym(&env, "NG");
         let category = sym(&env, "Food");
-
         env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &100, &10_u64).unwrap();
-        client.submit(&submitter, &country, &category, &999, &10_u64).unwrap(); // same ts
 
-        let history = client.get_history(&country, &category);
-        // Only one record — the first write wins.
-        assert_eq!(history.len(), 1);
-        assert_eq!(history.get(0).unwrap().value, 100);
-    }
+        submit_ok(&client, &submitter, &country, &category, 450, 50);
 
-    #[test]
-    fn get_history_includes_full_metadata_for_auditing() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &450, &50_u64).unwrap();
-
-        let history = client.get_history(&country, &category);
-        let record = history.get(0).unwrap();
-
+        let record = client.get_history(&country, &category).get(0).unwrap();
         assert_eq!(record.submitter, submitter);
         assert_eq!(record.country_iso, country);
         assert_eq!(record.category, category);
         assert_eq!(record.value, 450);
         assert_eq!(record.timestamp, 50);
+        assert_eq!(record.valid_from, 50);
+        assert_eq!(record.valid_until, 50 + DEFAULT_VALIDITY_WINDOW_SECS);
+        assert_eq!(record.status, SubmissionStatus::Pending);
     }
 
-    // ── get_history_range ─────────────────────────────────────────────────
-
     #[test]
-    fn get_history_range_filters_to_window() {
+    fn history_range_filters_inclusively() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
         let country = sym(&env, "NG");
         let category = sym(&env, "Food");
-
         env.mock_all_auths();
+
         for ts in [10_u64, 20, 30, 40, 50] {
-            client
-                .submit(&submitter, &country, &category, &(ts as i128 * 10), &ts)
-                .unwrap();
+            submit_ok(&client, &submitter, &country, &category, ts as i128 * 10, ts);
         }
 
-        let range = client
-            .get_history_range(&country, &category, &20_u64, &40_u64)
-            .unwrap();
+        let range = client.get_history_range(&country, &category, &20, &40).unwrap();
         assert_eq!(range.len(), 3);
         assert_eq!(range.get(0).unwrap().timestamp, 20);
         assert_eq!(range.get(1).unwrap().timestamp, 30);
         assert_eq!(range.get(2).unwrap().timestamp, 40);
+
+        // Both bounds inclusive.
+        let single = client.get_history_range(&country, &category, &10, &10).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.get(0).unwrap().timestamp, 10);
+
+        // A window with nothing in it.
+        let empty = client.get_history_range(&country, &category, &60, &70).unwrap();
+        assert_eq!(empty.len(), 0);
     }
 
     #[test]
-    fn get_history_range_inclusive_on_both_ends() {
+    fn history_range_rejects_an_inverted_range() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert_eq!(
+            client
+                .try_get_history_range(&sym(&env, "NG"), &sym(&env, "Food"), &100, &50)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidRange
+        );
+    }
+
+    #[test]
+    fn latest_is_the_most_recently_inserted_record() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
         let country = sym(&env, "NG");
         let category = sym(&env, "Food");
-
         env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &1, &10_u64).unwrap();
-        client.submit(&submitter, &country, &category, &2, &20_u64).unwrap();
 
-        let range = client
-            .get_history_range(&country, &category, &10_u64, &10_u64)
-            .unwrap();
-        assert_eq!(range.len(), 1);
-        assert_eq!(range.get(0).unwrap().timestamp, 10);
-    }
+        // Inserted out of timestamp order; the index is insertion-ordered, so
+        // "latest" is the last inserted, not the highest timestamp.
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 200, 30);
+        submit_ok(&client, &submitter, &country, &category, 150, 20);
 
-    #[test]
-    fn get_history_range_empty_window_returns_empty() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &1, &10_u64).unwrap();
-
-        let range = client
-            .get_history_range(&country, &category, &50_u64, &100_u64)
-            .unwrap();
-        assert_eq!(range.len(), 0);
-    }
-
-    #[test]
-    fn get_history_range_invalid_range_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        let err = client
-            .try_get_history_range(&country, &category, &100_u64, &50_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::InvalidRange);
-    }
-
-    #[test]
-    fn get_history_range_single_point_range() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "KE");
-        let category = sym(&env, "Rent");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &500, &42_u64).unwrap();
-
-        let range = client
-            .get_history_range(&country, &category, &42_u64, &42_u64)
-            .unwrap();
-        assert_eq!(range.len(), 1);
-    }
-
-    // ── get_latest ────────────────────────────────────────────────────────
-
-    #[test]
-    fn get_latest_returns_none_when_empty() {
-        let env = make_env();
-        let client = deploy(&env);
-        let result = client.get_latest(&sym(&env, "NG"), &sym(&env, "Food"));
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn get_status_returns_current_state_after_each_transition() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-    fn get_latest_returns_highest_timestamp() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "NG");
-        let category = sym(&env, "Food");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &100, &10_u64).unwrap();
-        client.submit(&submitter, &country, &category, &200, &30_u64).unwrap();
-        client.submit(&submitter, &country, &category, &150, &20_u64).unwrap();
-
-        // Last submitted is ts=20, but ts=30 has the highest timestamp.
-        // The index is in insertion order so latest = 20 (last inserted).
-        // This tests that get_latest returns the last *inserted* record,
-        // which matches the stored index behaviour documented in the module.
         let latest = client.get_latest(&country, &category).unwrap();
-        // Insertion order: 10, 30, 20 — last inserted timestamp is 20.
         assert_eq!(latest.timestamp, 20);
+        assert_eq!(latest.value, 150);
     }
 
     #[test]
-    fn get_latest_after_single_submission() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let country = sym(&env, "BR");
-        let category = sym(&env, "Transport");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &800, &50_u64).unwrap();
-        assert_eq!(client.get_status(&country, &category, &50_u64), Some(SubmissionStatus::Pending));
-
-        client
-            .set_status(&verifier, &country, &category, &50_u64, &SubmissionStatus::Verified)
-            .unwrap();
-        assert_eq!(client.get_status(&country, &category, &50_u64), Some(SubmissionStatus::Verified));
-    }
-
-    // ── round-trip: status is part of full record ─────────────────────────
-
-    #[test]
-    fn get_returns_status_embedded_in_submission() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-        let verifier = Address::generate(&env);
-        let country = sym(&env, "IN");
-        let category = sym(&env, "Health");
-
-        env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &300, &75_u64).unwrap();
-
-        let before = client.get(&country, &category, &75_u64).unwrap();
-        assert_eq!(before.status, SubmissionStatus::Pending);
-
-        client
-            .set_status(&verifier, &country, &category, &75_u64, &SubmissionStatus::Rejected)
-            .unwrap();
-
-        let after = client.get(&country, &category, &75_u64).unwrap();
-        assert_eq!(after.status, SubmissionStatus::Rejected);
-        // Other fields are unchanged.
-        assert_eq!(after.value, 300);
-        assert_eq!(after.submitter, submitter);
-    }
-
-    // ── API consistency ───────────────────────────────────────────────────
-
-    #[test]
-    fn status_values_are_distinct_and_stable() {
-        // Numeric discriminants are pinned so external consumers can safely
-        // match on the underlying u32 representation.
-        assert_eq!(SubmissionStatus::Pending as u32, 0);
-        assert_eq!(SubmissionStatus::Verified as u32, 1);
-        assert_eq!(SubmissionStatus::Rejected as u32, 2);
-        client.submit(&submitter, &country, &category, &750, &99_u64).unwrap();
-
-        let latest = client.get_latest(&country, &category).unwrap();
-        assert_eq!(latest.value, 750);
-        assert_eq!(latest.timestamp, 99);
-    }
-
-    #[test]
-    fn get_latest_is_scoped_per_country_and_category() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1, &100_u64)
-            .unwrap();
-        client
-            .submit(&submitter, &sym(&env, "KE"), &sym(&env, "Food"), &2, &200_u64)
-            .unwrap();
-
-        let ng_latest = client.get_latest(&sym(&env, "NG"), &sym(&env, "Food")).unwrap();
-        let ke_latest = client.get_latest(&sym(&env, "KE"), &sym(&env, "Food")).unwrap();
-
-        assert_eq!(ng_latest.timestamp, 100);
-        assert_eq!(ke_latest.timestamp, 200);
-    }
-
-    // ── determinism ───────────────────────────────────────────────────────
-
-    #[test]
-    fn history_deterministic_for_same_state() {
-        // Two calls on the same env produce identical results.
+    fn history_is_deterministic_for_the_same_state() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
         let country = sym(&env, "NG");
         let category = sym(&env, "Food");
-
         env.mock_all_auths();
-        client.submit(&submitter, &country, &category, &1, &1_u64).unwrap();
-        client.submit(&submitter, &country, &category, &2, &2_u64).unwrap();
+
+        submit_ok(&client, &submitter, &country, &category, 1, 1);
+        submit_ok(&client, &submitter, &country, &category, 2, 2);
 
         let first = client.get_history(&country, &category);
         let second = client.get_history(&country, &category);
-
         assert_eq!(first.len(), second.len());
         for i in 0..first.len() {
-            assert_eq!(first.get(i).unwrap().timestamp, second.get(i).unwrap().timestamp);
+            assert_eq!(
+                first.get(i).unwrap().timestamp,
+                second.get(i).unwrap().timestamp
+            );
         }
     }
 
-    // ── Arithmetic helpers exposed as contract entry points ───────────────
-    //
-    // These are thin wrappers around the `guards` module functions.  They are
-    // primarily useful for off-chain clients that want to pre-validate values
-    // before constructing a transaction, and for cross-contract callers.
+    // â”€â”€ bounded submitter history (#885) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Add two `i128` values, failing safely on overflow.
-    ///
-    /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — result would overflow `i128`.
-    pub fn safe_add(env: Env, a: i128, b: i128) -> Result<i128, Error> {
-        let _ = env;
-        guards::checked_add_i128(a, b)
-    }
-
-    /// Multiply two `i128` values, failing safely on overflow.
-    ///
-    /// # Errors
-    /// * [`Error::ArithmeticOverflowMul`] — result would overflow `i128`.
-    pub fn safe_mul(env: Env, a: i128, b: i128) -> Result<i128, Error> {
-        let _ = env;
-        guards::checked_mul_i128(a, b)
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
-    fn make_env() -> Env {
-        Env::default()
-    }
-
-    fn deploy(env: &Env) -> PriceVaultClient {
-        let contract_id = env.register(PriceVault, ());
-        PriceVaultClient::new(env, &contract_id)
-    }
-
-    fn sym(env: &Env, s: &str) -> Symbol {
-        Symbol::new(env, s)
-    }
-
-    // ── guards::require_positive_price ────────────────────────────────────
-
-    #[test]
-    fn guard_zero_price_rejected() {
-        assert_eq!(guards::require_positive_price(0), Err(Error::ZeroPrice));
+    /// Submit `count` records for one submitter, spreading them over countries
+    /// so the submitter index is genuinely cross-group.
+    fn seed_submitter(env: &Env, client: &PriceVaultClient, submitter: &Address, count: u32) {
+        let countries = ["NG", "KE", "BR"];
+        for i in 0..count {
+            client
+                .submit(
+                    submitter,
+                    &Symbol::new(env, countries[(i % 3) as usize]),
+                    &Symbol::new(env, "Food"),
+                    &((i as i128) + 1),
+                    &((i as u64) * 10 + 10),
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap();
+        }
     }
 
     #[test]
-    fn guard_negative_price_rejected() {
-        assert_eq!(guards::require_positive_price(-1), Err(Error::NegativePrice));
-        assert_eq!(
-            guards::require_positive_price(i128::MIN),
-            Err(Error::NegativePrice)
-        );
-    }
-
-    #[test]
-    fn guard_positive_price_accepted() {
-        assert!(guards::require_positive_price(1).is_ok());
-        assert!(guards::require_positive_price(i128::MAX).is_ok());
-    }
-
-    // ── guards::require_positive_u64 ─────────────────────────────────────
-
-    #[test]
-    fn guard_zero_u64_rejected() {
-        assert_eq!(guards::require_positive_u64(0), Err(Error::ZeroValue));
-    }
-
-    #[test]
-    fn guard_positive_u64_accepted() {
-        assert!(guards::require_positive_u64(1).is_ok());
-        assert!(guards::require_positive_u64(u64::MAX).is_ok());
-    }
-
-    // ── guards::require_positive_i128 ────────────────────────────────────
-
-    #[test]
-    fn guard_zero_i128_rejected() {
-        assert_eq!(
-            guards::require_positive_i128(0),
-            Err(Error::NonPositiveAmount)
-        );
-    }
-
-    #[test]
-    fn guard_negative_i128_rejected() {
-        assert_eq!(
-            guards::require_positive_i128(-1),
-            Err(Error::NonPositiveAmount)
-        );
-        assert_eq!(
-            guards::require_positive_i128(i128::MIN),
-            Err(Error::NonPositiveAmount)
-        );
-    }
-
-    #[test]
-    fn guard_positive_i128_accepted() {
-        assert!(guards::require_positive_i128(1).is_ok());
-        assert!(guards::require_positive_i128(i128::MAX).is_ok());
-    }
-
-    // ── guards::checked_add_u64 ───────────────────────────────────────────
-
-    #[test]
-    fn checked_add_u64_normal() {
-        assert_eq!(guards::checked_add_u64(100, 200), Ok(300));
-    }
-
-    #[test]
-    fn checked_add_u64_overflow_rejected() {
-        assert_eq!(
-            guards::checked_add_u64(u64::MAX, 1),
-            Err(Error::ArithmeticOverflow)
-        );
-    }
-
-    #[test]
-    fn checked_add_u64_max_plus_zero() {
-        // Adding zero to MAX is valid.
-        assert_eq!(guards::checked_add_u64(u64::MAX, 0), Ok(u64::MAX));
-    }
-
-    // ── guards::checked_add_i128 ──────────────────────────────────────────
-
-    #[test]
-    fn checked_add_i128_normal() {
-        assert_eq!(guards::checked_add_i128(50, 50), Ok(100));
-    }
-
-    #[test]
-    fn checked_add_i128_positive_overflow_rejected() {
-        assert_eq!(
-            guards::checked_add_i128(i128::MAX, 1),
-            Err(Error::ArithmeticOverflow)
-        );
-    }
-
-    #[test]
-    fn checked_add_i128_negative_overflow_rejected() {
-        assert_eq!(
-            guards::checked_add_i128(i128::MIN, -1),
-            Err(Error::ArithmeticOverflow)
-        );
-    }
-
-    // ── guards::checked_mul_i128 ──────────────────────────────────────────
-
-    #[test]
-    fn checked_mul_i128_normal() {
-        assert_eq!(guards::checked_mul_i128(3, 4), Ok(12));
-    }
-
-    #[test]
-    fn checked_mul_i128_overflow_rejected() {
-        assert_eq!(
-            guards::checked_mul_i128(i128::MAX, 2),
-            Err(Error::ArithmeticOverflowMul)
-        );
-    }
-
-    #[test]
-    fn checked_mul_i128_negative_times_negative() {
-        // -i128::MAX * 2 overflows: -(2^127 - 1) * 2 = -(2^128 - 2) < i128::MIN.
-        assert_eq!(
-            guards::checked_mul_i128(i128::MIN, -1),
-            Err(Error::ArithmeticOverflowMul)
-        );
-    }
-
-    // ── submit: fail-safe price validation ───────────────────────────────
-
-    #[test]
-    fn submit_zero_price_rejected() {
+    fn submitter_history_pages_through_every_record_exactly_once() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
-
+        let other = Address::generate(&env);
         env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &0, &100_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::ZeroPrice);
+
+        seed_submitter(&env, &client, &submitter, 7);
+        // A second submitter must not appear in the first one's history.
+        seed_submitter(&env, &client, &other, 2);
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cursor: u32 = 0;
+        loop {
+            let page = client.get_submitter_history(&submitter, &cursor, &3).unwrap();
+            for record in page.submissions.iter() {
+                seen.push_back(record.timestamp);
+            }
+            assert!(page.submissions.len() <= 3);
+            if !page.has_more {
+                // An exhausted cursor terminates the walk.
+                assert_eq!(page.next_cursor, 7);
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        assert_eq!(seen.len(), 7);
+        // Append-only ordering, and no duplicates from the paging.
+        let mut expected: Vec<u64> = Vec::new();
+        for i in 0..7u64 {
+            expected.push_back(i * 10 + 10);
+        }
+        assert_eq!(seen, expected);
     }
 
     #[test]
-    fn submit_negative_price_rejected() {
+    fn submitter_history_rejects_an_out_of_range_page_size() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
-
         env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &-1, &100_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::NegativePrice);
+
+        assert_eq!(
+            client
+                .try_get_submitter_history(&submitter, &0, &0)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidPageSize
+        );
+        assert_eq!(
+            client
+                .try_get_submitter_history(&submitter, &0, &(MAX_HISTORY_PAGE_SIZE + 1))
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidPageSize
+        );
     }
 
     #[test]
-    fn submit_very_negative_price_rejected() {
+    fn submitter_history_cursor_is_stable_when_new_records_land() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
-
         env.mock_all_auths();
-        let err = client
-            .try_submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &i128::MIN,
-                &100_u64,
-            )
-            .unwrap_err()
+
+        seed_submitter(&env, &client, &submitter, 4);
+
+        // Read the first page, then let more records land mid-pagination.
+        let first = client.get_submitter_history(&submitter, &0, &2).unwrap();
+        assert_eq!(first.submissions.len(), 2);
+        assert!(first.has_more);
+
+        seed_submitter(&env, &client, &submitter, 2);
+
+        // Resuming from the cursor we were handed still reads forward, and the
+        // records we already saw are not repeated.
+        let second = client
+            .get_submitter_history(&submitter, &first.next_cursor, &10)
             .unwrap();
-        assert_eq!(err, Error::NegativePrice);
+        assert_eq!(second.submissions.len(), 4);
+        for record in second.submissions.iter() {
+            assert!(record.timestamp > 30);
+        }
     }
 
     #[test]
-    fn submit_zero_timestamp_rejected() {
+    fn submitter_history_is_empty_for_an_unknown_submitter() {
         let env = make_env();
         let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &100, &0_u64)
-            .unwrap_err()
+        let page = client
+            .get_submitter_history(&Address::generate(&env), &0, &10)
             .unwrap();
-        assert_eq!(err, Error::InvalidTimestamp);
+        assert_eq!(page.submissions.len(), 0);
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, 0);
     }
 
-    #[test]
-    fn submit_valid_values_succeeds() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &1_000, &100_u64)
-            .unwrap();
-
-        let got = client.get(&sym(&env, "NG"), &sym(&env, "Food"), &100_u64).unwrap();
-        assert_eq!(got.value, 1_000);
-    }
-
-    // ── safe_add / safe_mul contract entry points ─────────────────────────
+    // â”€â”€ pure helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
-    fn safe_add_normal() {
+    fn safe_arithmetic_entry_points() {
         let env = make_env();
         let client = deploy(&env);
         assert_eq!(client.safe_add(&10, &20), Ok(30));
-    }
-
-    #[test]
-    fn safe_add_overflow_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
+        assert_eq!(client.safe_mul(&6, &7), Ok(42));
         assert_eq!(
             client.try_safe_add(&i128::MAX, &1).unwrap_err().unwrap(),
             Error::ArithmeticOverflow
         );
-    }
-
-    #[test]
-    fn safe_mul_normal() {
-        let env = make_env();
-        let client = deploy(&env);
-        assert_eq!(client.safe_mul(&6, &7), Ok(42));
-    }
-
-    #[test]
-    fn safe_mul_overflow_returns_error() {
-        let env = make_env();
-        let client = deploy(&env);
         assert_eq!(
             client.try_safe_mul(&i128::MAX, &2).unwrap_err().unwrap(),
             Error::ArithmeticOverflowMul
         );
     }
 
-    /// Validate a submit payload against the schema without committing any
-    /// state.
-    ///
-    /// Useful for SDK clients that want to pre-validate arguments before
-    /// constructing a transaction, and for cross-contract callers that need
-    /// to confirm a payload is structurally sound before forwarding it.
-    ///
-    /// Returns `Ok(())` on a valid payload; a specific [`Error`] variant on
-    /// the first failing constraint.
-    pub fn validate_submit_payload(
-        env: Env,
-        country_iso: Symbol,
-        category: Symbol,
-        value: i128,
-        timestamp: u64,
-    ) -> Result<(), Error> {
-        let _ = env;
-        payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country_iso,
-                category: &category,
-                value,
-                timestamp,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
+    #[test]
+    fn validate_submit_payload_commits_no_state() {
+        let env = make_env();
+        let client = deploy(&env);
+
+        assert!(client
+            .validate_submit_payload(&sym(&env, "KE"), &sym(&env, "Rent"), &500, &50)
+            .is_ok());
+        assert_eq!(
+            client
+                .try_validate_submit_payload(&sym(&env, "KE"), &sym(&env, "Rent"), &-1, &50)
+                .unwrap_err()
+                .unwrap(),
+            Error::NegativeNotAllowed
+        );
+        // Nothing was written.
+        assert!(client.get(&sym(&env, "KE"), &sym(&env, "Rent"), &50).is_none());
+    }
+
+    // â”€â”€ constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    #[test]
+    fn documented_constants_hold() {
+        assert_eq!(DEFAULT_VALIDITY_WINDOW_SECS, 86_400);
+        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(registry::VERSION, 1);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
-
-    fn make_env() -> Env {
-        Env::default()
-    }
-
-    fn deploy(env: &Env) -> PriceVaultClient {
-        let contract_id = env.register(PriceVault, ());
-        PriceVaultClient::new(env, &contract_id)
-    }
-
-    fn sym(env: &Env, s: &str) -> Symbol {
-        Symbol::new(env, s)
-    }
-
-    // ── Pure validate() unit tests (no Env needed) ────────────────────────
-
-    fn make_valid_payload(env: &Env) -> (Symbol, Symbol) {
-        (sym(env, "NG"), sym(env, "Food"))
-    }
-
-    #[test]
-    fn valid_payload_passes_schema() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let result = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 1_000,
-                timestamp: 100,
-                schema_version: SCHEMA_VERSION,
-            },
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn zero_timestamp_fails_u64_non_zero() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let err = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 1_000,
-                timestamp: 0,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::ZeroNotAllowed);
-    }
-
-    #[test]
-    fn zero_value_fails_i128_positive() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let err = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 0,
-                timestamp: 100,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::ZeroNotAllowed);
-    }
-
-    #[test]
-    fn negative_value_fails_i128_positive() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let err = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: -1,
-                timestamp: 100,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::NegativeNotAllowed);
-    }
-
-    #[test]
-    fn value_above_ceiling_fails_i128_max() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        // SUBMIT_SCHEMA ceiling is 1_000_000_000_000
-        let err = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 1_000_000_000_001,
-                timestamp: 100,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::ValueAboveMaximum);
-    }
-
-    #[test]
-    fn value_at_ceiling_passes() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let result = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 1_000_000_000_000, // exactly at ceiling
-                timestamp: 100,
-                schema_version: SCHEMA_VERSION,
-            },
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn wrong_schema_version_fails_schema_version_constraint() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let err = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 1_000,
-                timestamp: 100,
-                schema_version: 99, // wrong version
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::SchemaMismatch);
-    }
-
-    #[test]
-    fn correct_schema_version_passes() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let result = payload::validate(
-            SUBMIT_SCHEMA,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 500,
-                timestamp: 42,
-                schema_version: SCHEMA_VERSION,
-            },
-        );
-        assert!(result.is_ok());
-    }
-
-    // ── Constraint::SymbolNonEmpty ────────────────────────────────────────
-
-    #[test]
-    fn empty_country_symbol_fails() {
-        let env = Env::default();
-        let empty = sym(&env, "");
-        let category = sym(&env, "Food");
-        // Only SymbolNonEmpty constraint for this test.
-        let schema = &[payload::Constraint::SymbolNonEmpty];
-        let err = payload::validate(
-            schema,
-            &payload::SubmitPayload {
-                country_iso: &empty,
-                category: &category,
-                value: 100,
-                timestamp: 1,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::EmptySymbol);
-    }
-
-    // ── Constraint::I128NonNegative ───────────────────────────────────────
-
-    #[test]
-    fn i128_non_negative_accepts_zero() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let schema = &[payload::Constraint::I128NonNegative];
-        let result = payload::validate(
-            schema,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: 0,
-                timestamp: 1,
-                schema_version: SCHEMA_VERSION,
-            },
-        );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn i128_non_negative_rejects_negative() {
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let schema = &[payload::Constraint::I128NonNegative];
-        let err = payload::validate(
-            schema,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: -100,
-                timestamp: 1,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::NegativeNotAllowed);
-    }
-
-    // ── Constraint evaluation order ───────────────────────────────────────
-
-    #[test]
-    fn first_failing_constraint_is_returned() {
-        // Schema: U64NonZero, then I128Positive.
-        // Both timestamp=0 and value=-1 are invalid.
-        // U64NonZero is first, so ZeroNotAllowed must be the error.
-        let env = Env::default();
-        let (country, category) = make_valid_payload(&env);
-        let schema = &[
-            payload::Constraint::U64NonZero,
-            payload::Constraint::I128Positive,
-        ];
-        let err = payload::validate(
-            schema,
-            &payload::SubmitPayload {
-                country_iso: &country,
-                category: &category,
-                value: -1,
-                timestamp: 0,
-                schema_version: SCHEMA_VERSION,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err, Error::ZeroNotAllowed); // not NegativeNotAllowed
-    }
-
-    // ── Contract entry points ─────────────────────────────────────────────
-
-    #[test]
-    fn submit_valid_payload_succeeds() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        client
-            .submit(
-                &submitter,
-                &sym(&env, "NG"),
-                &sym(&env, "Food"),
-                &1_000,
-                &100_u64,
-            )
-            .unwrap();
-
-        let got = client.get(&sym(&env, "NG"), &sym(&env, "Food"), &100_u64).unwrap();
-        assert_eq!(got.value, 1_000);
-    }
-
-    #[test]
-    fn submit_zero_value_rejected_by_schema() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &0, &100_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::ZeroNotAllowed);
-    }
-
-    #[test]
-    fn submit_negative_value_rejected_by_schema() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &-500, &100_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::NegativeNotAllowed);
-    }
-
-    #[test]
-    fn submit_zero_timestamp_rejected_by_schema() {
-        let env = make_env();
-        let client = deploy(&env);
-        let submitter = Address::generate(&env);
-
-        env.mock_all_auths();
-        let err = client
-            .try_submit(&submitter, &sym(&env, "NG"), &sym(&env, "Food"), &100, &0_u64)
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::ZeroNotAllowed);
-    }
-
-    #[test]
-    fn validate_submit_payload_entry_point_accepts_valid() {
-        let env = make_env();
-        let client = deploy(&env);
-
-        let result = client
-            .validate_submit_payload(&sym(&env, "KE"), &sym(&env, "Rent"), &500, &50_u64);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_submit_payload_entry_point_rejects_negative() {
-        let env = make_env();
-        let client = deploy(&env);
-
-        let err = client
-            .try_validate_submit_payload(
-                &sym(&env, "KE"),
-                &sym(&env, "Rent"),
-                &-1,
-                &50_u64,
-            )
-            .unwrap_err()
-            .unwrap();
-        assert_eq!(err, Error::NegativeNotAllowed);
-    }
-}
-
