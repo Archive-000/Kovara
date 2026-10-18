@@ -84,6 +84,115 @@ reading all of them in one transaction — so the cap turns that into a bounded,
 predictable cost and makes an over-large request fail loudly rather than being
 silently truncated.
 
+## The pool-wide aggregate
+
+`total_stake()` is a **stored running total**, seeded to `0` at initialization
+and updated by `stake`, `withdraw` and `slash` in the same call that updates the
+per-address balance.
+
+Every mutation derives both values with checked arithmetic **before** either
+write:
+
+```text
+stake:      new_aggregate = total.checked_add(amount)
+withdraw:   new_aggregate = total.checked_sub(amount)
+slash:      new_aggregate = total.checked_sub(amount)
+```
+
+The increment is read once and reused, so the balance and the total come from
+one arithmetic step rather than two that could drift. A refused operation moves
+neither side.
+
+`the_aggregate_never_disagrees_with_the_balances` states the invariant
+explicitly: `total_stake() == balance(a) + balance(b) + ...`. It is checked after
+a withdrawal and again after a refused one.
+
+The total saturating against a maximal balance is deliberate, not a bug:
+`stake(i128::MAX)` succeeds, and the *next* deposit is refused with
+`InvalidStake` because the aggregate would overflow — with the second address's
+balance left at `0` rather than wrapped negative.
+
+## The emergency pause
+
+`pause` stops value movement without freezing the pool's configuration.
+
+| Call | Paused | Not paused |
+| --- | --- | --- |
+| `stake` | `PoolPaused` | succeeds |
+| `withdraw` | `PoolPaused` | succeeds |
+| `slash` | `PoolPaused` | succeeds |
+| `deregister` | `PoolPaused` | succeeds |
+| `pause` | succeeds (idempotent) | succeeds |
+| `unpause` | succeeds | refused — nothing to undo |
+| `set_threshold`, `set_min_stake` | succeeds | succeeds |
+| `set_governance`, `set_challenge_period` | succeeds | succeeds |
+| every read | succeeds | succeeds |
+
+Value movement stops; configuration and the emergency controls do not. A pause
+that also froze `unpause` or the configuration setters would be a one-way trip
+for the operator dealing with the incident.
+
+`PauseChangedEvent` carries the pool-wide aggregate, so an indexer can see the
+pause without a follow-up read.
+
+Pausing is held by **governance**, not by the admin — stopping the pool from
+moving value is an operational power, not a configuration one. `set_governance`
+assigns it. Until that call is made, `pause` and `unpause` are refused with
+`PauseNotAuthorized`; there is **no fallback to the caller**.
+
+## Leaving the set
+
+A registered sentinel's withdrawal may take the balance down to `min_stake` and
+no further. Taking it to zero is what "leaving the set" means, and it is a
+separate lifecycle step so that the reason is recorded:
+
+```text
+stake ──► registered ──deregister──► deregistered ──wait lock + challenge──► exited
+```
+
+* `deregister(sentinel)` records the ledger and the challenge period in force.
+  The stake stays in the pool throughout — deregistering is not a withdrawal, and
+  the balance is still there for a slash under review.
+* A full exit (`remaining == 0`) requires a recorded deregistration
+  (`NotDeregistered` otherwise) and an elapsed challenge period
+  (`ChallengePeriodActive` otherwise). The `min_stake` floor does not apply to
+  an exit.
+* Partial withdrawals by a deregistered sentinel still respect the floor: the
+  challenge period gates the *exit*, not ordinary withdrawals, which were always
+  available down to the floor.
+* `stake` is refused for a deregistered address (`AlreadyDeregistered`). Allowing
+  a one-unit top-up during the challenge period would let a sentinel reset the
+  window and skip the delay.
+* Completing an exit clears the record, so a returning sentinel registers clean
+  and a later exit needs its own deregistration and its own challenge period.
+
+### The challenge period is not retroactive
+
+`Deregistration { at, challenge_period }` copies the period that was in force at
+deregistration. `set_challenge_period` afterwards cannot cut short a challenge
+period that is already running — otherwise shortening it would be a way to
+retroactively strip an exit right. `withdrawable_at(sentinel)` reports the
+recorded deadline.
+
+The period is bounded by `MAX_CHALLENGE_PERIOD_LEDGERS` (20 000 000) so
+`at + period` stays representable in a `u64`; the default is
+`DEFAULT_CHALLENGE_PERIOD_LEDGERS` (2 592 000 — thirty days), long enough for a
+slash under review to conclude.
+
+## Sentinel eligibility
+
+`is_eligible(sentinel, at_ledger)` answers "would this address count as an
+active sentinel at ledger N?" in one read:
+
+1. the balance is at or above `min_stake`;
+2. the address is not deregistered;
+3. the withdrawal lock has elapsed at `at_ledger`.
+
+The ledger is a parameter so a caller can ask the hypothetical question — "will
+this sentinel be eligible at the next halving?" — without waiting for it.
+Asking about a past ledger gives that ledger's answer. An unknown address
+returns `false`, not an error: "not eligible" is the answer, not a failure.
+
 ## Prerequisites
 
 - Rust **stable** (1.84+ recommended; the Soroban environment supports 1.82+)
