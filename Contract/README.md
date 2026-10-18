@@ -192,6 +192,355 @@ The ledger is a parameter so a caller can ask the hypothetical question — "wil
 this sentinel be eligible at the next halving?" — without waiting for it.
 Asking about a past ledger gives that ledger's answer. An unknown address
 returns `false`, not an error: "not eligible" is the answer, not a failure.
+## Slashing is a governed, reversible process
+
+A slash takes a sentinel's stake immediately, but it is the start of a process
+rather than the end of one:
+
+```text
+ slash ──► Pending ──appeal──► Pending ──resolve──► Upheld | Reversed
+              │                  │
+              └──────────────────┘
+         appeal only until `appeal_deadline`
+```
+
+### Governance authorization
+
+Every slash operation — `slash`, `appeal_slash`, `resolve_slash` — requires the
+configured governance address, resolved by `require_governance`:
+
+| Stored `DataKey::Governance` | Caller | Result |
+| --- | --- | --- |
+| `Some(g)` | `g` | authorized |
+| `Some(g)` | anything else | `NotGovernance` |
+| absent | anything | `GovernanceNotConfigured` |
+
+There is **no fallback to the caller**. An ungoverned pool cannot be slashed at
+all, rather than being governed by whoever happened to sign the transaction.
+
+Governance is deliberately a separate key from `Admin`. Collapsing them would
+mean whoever can change `min_stake` can also confiscate stake. `set_governance`
+lets the admin rotate it; the old address loses the power on the next ledger.
+
+`initialize` takes `governance` explicitly rather than inferring it from `admin`
+— the two may be the same address for a single-operator deployment, but the
+contract never *assumes* that.
+
+### Evidence references
+
+`slash` takes a `SlashEvidence { proof_ref, uri, content_hash }`, stored on the
+`SlashRecord` and republished on `SlashedEvent`. The three fields answer the
+three questions an auditor asks: *which case*, *where is the record*, and *is
+this the record I am looking at* — the hash pins the content so a mutable URI
+cannot quietly change what the evidence says.
+
+A record with an empty `proof_ref` or an empty `uri` is refused with
+`InvalidEvidence`. The stake is taken immediately; a confiscation that cannot be
+pointed at its justification cannot be appealed on evidence either.
+
+`proof_ref` is a **data** field on the event, not a topic — it is
+high-cardinality, and adding it as a topic would bloat the topic set of a
+consumer filtering on "every slash for this reason".
+
+### The appeal window
+
+Each record carries the window in force when the slash was applied:
+
+```text
+appeal_deadline = slashed_at + appeal_window
+```
+
+An appeal is accepted while `ledger.sequence() <= appeal_deadline` and refused
+from the ledger after it with `AppealWindowClosed`.
+
+| Check | Meaning |
+| --- | --- |
+| `now <= appeal_deadline` | inside the window |
+| `now > appeal_deadline` | `AppealWindowClosed` |
+| `appeal_window == 0` | `AppealWindowClosed` — a zero window closes the deadline on the ledger the slash was applied |
+
+**The window is copied onto the record, so it is not retroactive.**
+`set_appeal_window` afterwards cannot close an appeal a sentinel is already
+entitled to file — otherwise shortening the window would be a way to retroactively
+strip an open appeal right.
+
+`appeal_window` is bounded by `MAX_APPEAL_WINDOW_LEDGERS` (6 000 000) so the
+deadline is representable in a `u64` for every reachable `slashed_at`. The
+default is `DEFAULT_APPEAL_WINDOW_LEDGERS` (604 800 — seven days).
+
+An appeal does **not** restore the stake. The slash stands until governance
+resolves it; the appeal only marks the record as disputed.
+
+The appellant may be the slashed sentinel or the governance address — the two
+parties to the dispute. Anyone else is refused.
+
+### Resolution is terminal and happens exactly once
+
+`resolve_slash(governance, proof_ref, uphold)` upholds or reverses a slash once.
+A second call is `AlreadyResolved`, whichever outcome it asks for. Without that
+constraint a reversed slash could be reversed again, restoring the same stake
+twice.
+
+| `uphold` | Effect |
+| --- | --- |
+| `true` | Stake stays removed; `restored == 0`; outcome `Upheld` |
+| `false` | `amount` added back with `checked_add`; outcome `Reversed` |
+
+A reversal that would overflow `i128` is refused with `InsufficientBalance`
+rather than wrapping the balance. The `outcome` check happens before every write,
+so a refused resolution leaves both the record and the stake untouched and the
+record is never half-resolved.
+## The withdrawal lock is a window, not a countdown
+
+A sentinel's lock is stored as one absolute ledger — `staked_at` — and runs
+until `unlock_at = staked_at + lock_period`. `unlock_at(env, sentinel)` returns
+that ledger, or `None` for an address that has never staked.
+
+### Lock arithmetic is checked
+
+`unlock_at` is derived with `checked_add`. An unrepresentable window returns
+`InvalidLockPeriod`; it is never saturated to `u64::MAX`, because a saturated
+window reads as "locked forever" without saying so.
+
+`withdraw` compares ledgers directly — `now < unlock_at` — rather than computing
+`now - staked_at` and comparing the difference. A saturating subtraction would
+silently report "the lock has elapsed" for a window that has not been reached;
+the direct comparison is exact at both boundaries.
+
+`lock_period` is additionally bounded by `MAX_LOCK_PERIOD` (1 000 000) at
+initialization, so every reachable unlock ledger is representable. The runtime
+check is kept anyway: bounding the parameter at configuration time and checking
+the arithmetic at use time are different guarantees.
+
+### A top-up never extends a running lock
+
+`stake` leaves `staked_at` untouched while `now < unlock_at`, and sets it to the
+current ledger once that window has elapsed.
+
+| Event | `staked_at` becomes |
+| --- | --- |
+| First deposit | current ledger |
+| Top-up **while the lock is running** | unchanged — the window does not move |
+| Top-up **at or after expiry** | current ledger — a fresh window |
+
+Both halves of that matter:
+
+* Letting a top-up move the window would let a sentinel push their own unlock
+  date out indefinitely by depositing one unit repeatedly — the lock becomes a
+  fee rather than a constraint.
+* Resetting it unconditionally on every deposit is worse: a top-up landing one
+  ledger before expiry would silently extend the lock by the full
+  `lock_period`, which is a trap rather than a policy.
+
+`stake` reads the existing start as an `Option`, not `unwrap_or(0)`, so a
+deposit that lands on genesis ledger `0` is a real recorded window and not
+mistaken for "never staked".
+
+## Slash amounts are bounded before anything is written
+
+`slash` checks three bounds, in order, all before the first write:
+
+| Bound | Error |
+| --- | --- |
+| `proof_id` is non-empty | `InvalidProofId` |
+| `amount > 0` | `InvalidSlashAmount` |
+| `amount <= current stake` | `SlashExceedsStake` |
+| remainder `>= min_stake` | `StakeBelowMinimum` |
+
+The three amount bounds are distinct conditions with distinct remedies — a
+malformed call, an unaffordable one, and one that would de-register the
+sentinel — so each gets its own error instead of collapsing into one.
+
+Because the balance map and the proof map are written only after every check
+passes, a refused slash leaves **both** the stake and the proof identifier
+untouched. An identifier that failed a call is still unused and still usable
+exactly once.
+
+## Slash proof identity
+
+Replay protection keys on a caller-supplied `proof_id`, not on
+`(sentinel, reason)`.
+
+That pair was not unique in either direction:
+
+* **False rejection.** Two genuinely distinct incidents against the same
+  sentinel sharing a reason code (`fraudulent_submission`) collided, and the
+  second was refused as a replay of the first.
+* **False acceptance.** One incident relabelled with a different reason code
+  passed twice.
+
+`proof_id` is a non-empty `String` chosen by the caller and required to be unique
+within the pool. `reason` stays a `Symbol` and an event topic for filtering, but
+carries no replay semantics.
+
+Uniqueness is global rather than per-sentinel: re-submitting an identifier is
+refused identically whether the sentinel, the reason, or both differ. That is the
+point — under the old `(sentinel, reason)` key the same case file could be
+applied against a second address simply by changing one component of the key.
+
+`slash_proof(proof_id)` returns the stored [`SlashProof`] — sentinel, reason,
+amount and ledger — so an auditor holding an identifier can ask the contract
+what it was applied to without replaying the event stream.
+
+### Event schema
+
+`SlashedEvent` gains `proof_id`, `remaining` and `slashed_at`. `proof_id` is
+deliberately **not** a topic: it is high-cardinality, and adding it as a topic
+would bloat the topic set of a consumer subscribed to "every slash for this
+reason".
+## SentinelPool initialization
+
+`SentinelPool` is only meaningful once it has been configured. Every
+state-changing entry point — `stake`, `withdraw`, `set_threshold`,
+`set_min_stake` and `slash` — opens by calling `require_initialized`, which
+returns `Error::NotInitialized` when `DataKey::Admin` is absent. `is_initialized`
+exposes the same fact as a view.
+
+Without that guard the read-path defaults (`min_stake -> 0`,
+`lock_period -> 0`) describe a real pool with **no minimum stake and no
+withdrawal lock**: anyone could stake nothing, and `withdraw` would behave as
+though no lock existed. The guard converts that accidental configuration into an
+explicit, stable error.
+
+`initialize` is all-or-nothing. Parameters are validated in a fixed order, each
+step a pure predicate over the arguments, and all of them run **before**
+`require_auth` and before the first write:
+
+| Parameter | Rule | Error |
+| --- | --- | --- |
+| `min_stake` | `> 0` | `InvalidStake` |
+| `lock_period` | `1 <= n <= MAX_LOCK_PERIOD` | `InvalidLockPeriod` |
+| `threshold` | `> 0` | `InvalidThreshold` |
+
+A refused call therefore leaves **no** partial configuration behind:
+`is_initialized` keeps reporting `false`, `min_stake` and `threshold` keep
+reporting `0`, and a later corrected call still succeeds. A second successful
+initialization is refused with `Unauthorized`.
+
+`MAX_LOCK_PERIOD` (1 000 000 ledgers) exists because the lock is measured in
+`ledger.sequence()`, a `u32`. A lock that could not elapse would freeze every
+sentinel's stake permanently, so the parameter is bounded at configuration time
+rather than trusted.
+
+## SentinelPool authorization
+
+`set_threshold`, `set_min_stake` and `slash` all resolve the admin the same way,
+through `require_admin`:
+
+```text
+stored Admin == caller  ->  authorized
+anything else           ->  Unauthorized
+```
+
+The stored value is **mandatory**. The previous lookup fell back to
+`unwrap_or_else(|| caller.clone())`, so on an unconfigured pool the comparison
+`admin != stored_admin` was always false and whichever address authorized the
+call became the admin by default. Requiring a stored admin removes that path;
+combined with the initialization guard, an unconfigured pool cannot be
+configured *or* governed by anyone.
+
+## SentinelPool checked arithmetic
+
+| Operation | Guard | Failure |
+| --- | --- | --- |
+| `stake` balance | `checked_add` | `InvalidStake` |
+| `withdraw` remainder | `checked_sub` | `InsufficientBalance` |
+| `slash` remainder | `checked_sub` | `InsufficientBalance` |
+
+All three run **before** the balance map is written, so an overflow or an
+excessive withdrawal leaves the sentinel's stake exactly as it was — no partial
+write, no event. `stake(&sentinel, &i128::MAX)` therefore succeeds once (the
+balance *is* `i128::MAX`) and is refused on replay, because the second call is
+the one that would overflow.
+## The `min_stake` floor is a registration rule
+
+An address holding a non-zero stake is a **registered sentinel**, and a
+registered sentinel is expected to keep at least `min_stake` deposited for as
+long as it stays registered. `stake` enforces the floor on the way in and
+`withdraw` enforces it on the way out, so it holds at every balance the pool
+ever exposes — including the very first one, because `stake` compares the
+*resulting* balance rather than the increment.
+
+The rule, stated plainly:
+
+| Resulting balance | `stake` / `withdraw` |
+| --- | --- |
+| `== min_stake` | accepted |
+| `> min_stake` | accepted |
+| `< min_stake` | `StakeBelowMinimum` |
+| `0` | `StakeBelowMinimum` |
+
+So a **partial withdrawal may take a sentinel down to exactly `min_stake` and no
+further**. Withdrawing the whole balance is not available through `withdraw`,
+because a zero balance would silently de-register the address — and the pool has
+no separate step recording *why* an address stopped being a sentinel. Leaving
+the set is a lifecycle event with its own rules, not an arithmetic side effect
+of an amount.
+
+Raising `min_stake` above balances that already exist does not retroactively
+invalidate them, and it does not trap those sentinels: every withdrawal they
+attempt is refused with `StakeBelowMinimum` and their balance is preserved
+intact.
+
+## SentinelPool withdrawal accounting
+
+`withdraw` runs its checks in a fixed order and writes the balance map only once
+all of them pass:
+
+| # | Check | Error |
+| --- | --- | --- |
+| 1 | `amount > 0` | `InvalidStake` |
+| 2 | `amount <= balance` | `InsufficientBalance` |
+| 3 | lock elapsed | `LockPeriodActive` |
+| 4 | `balance - amount` via `checked_sub` | `InsufficientBalance` |
+| 5 | `balance - amount >= min_stake` | `StakeBelowMinimum` |
+
+Step 2 makes step 4 unreachable in practice; `checked_sub` is kept anyway so
+that `remaining` is derived by checked arithmetic on the line that consumes it.
+Because nothing is written until step 5 succeeds, **every** rejection — invalid
+amount, excessive amount, active lock, below-minimum remainder — leaves the
+sentinel's balance byte-for-byte unchanged and emits no event.
+
+## SentinelPool stake queries
+
+All three are views: they read storage and the ledger, write nothing, and emit
+nothing, so an indexer can poll them without perturbing the pool.
+
+| Call | Returns |
+| --- | --- |
+| `balance(sentinel)` | The deposited amount |
+| `staked_at(sentinel)` | Ledger sequence number the current lock started on |
+| `stake_of(sentinel)` | `SentinelStake { amount, staked_at, unlock_at, unlocked }` |
+| `total_active_stake()` | Sum of every deposited amount |
+
+`stake_of` is total: an address that never staked reports the zero record
+(`amount == 0`, `staked_at == 0`, `unlocked == true`) rather than failing, so a
+caller enumerating candidates never has to distinguish "not a sentinel yet" from
+"the read failed". `unlock_at` saturates rather than overflowing — it is a
+reporting value, and "the unlock ledger is unreachable" is more useful to a
+caller than a failed read.
+
+`total_active_stake` is **computed at read time**, not stored. A cached running
+total is one forgotten update away from disagreeing with the per-address
+balances it is supposed to summarize; folding the map costs one pass, which is
+the same order as any governance read that must see every sentinel. Sums
+saturate at `i128::MAX` instead of wrapping.
+
+## Stake events
+
+`StakedEvent` carries the resulting balance and the ledger the lock runs from:
+
+| Field | Why it is there |
+| --- | --- |
+| `sentinel` | **Topic** — who deposited |
+| `amount` | The increment, which alone does not reconstruct the position |
+| `total` | The balance *after* this deposit; two equal deposits against different starting balances are very different events |
+| `staked_at` | The ledger the deposit landed on, and therefore where the withdrawal lock starts |
+
+`amount` and `total` are both needed by an indexer that rebuilds balances from
+the event stream rather than by polling `balance`. The ledger sequence is read
+once inside `stake` and reused for both `StakedAt` storage and the event, so the
+stored timestamp and the published one cannot disagree.
 
 ## Prerequisites
 
