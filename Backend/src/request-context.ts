@@ -69,6 +69,26 @@ export function getRequestId(): string | undefined {
   return requestIdStore.getStore();
 }
 
+/**
+ * Add the active request id to an API error body when one is available.
+ * Calls outside an HTTP request keep the original body unchanged.
+ */
+export function withRequestId<T>(
+  body: T,
+  requestId = getRequestId()
+): T | (T & { requestId: string }) {
+  if (
+    !requestId ||
+    body === null ||
+    typeof body !== "object" ||
+    !("error" in body) ||
+    !("code" in body)
+  ) {
+    return body;
+  }
+  return { ...body, requestId };
+}
+
 /** Run `fn` with `requestId` bound to the current async execution. */
 export function runWithRequestId<T>(requestId: string, fn: () => T): T {
   return requestIdStore.run(requestId, fn);
@@ -90,6 +110,13 @@ export function requestIdMiddleware(
   req.correlationId = requestId;
   res.setHeader(REQUEST_ID_HEADER, requestId);
   res.setHeader(CORRELATION_ID_HEADER, requestId);
+  const sendJson = res.json.bind(res);
+  res.json = ((body: unknown) => {
+    const activeRequestId = getRequestId() ?? req.requestId;
+    return sendJson(
+      res.statusCode >= 400 ? withRequestId(body, activeRequestId) : body
+    );
+  }) as Response["json"];
   // Everything downstream of next() runs inside this scope, so outbound calls
   // and logs made while handling the request share the same id.
   runWithRequestId(requestId, next);

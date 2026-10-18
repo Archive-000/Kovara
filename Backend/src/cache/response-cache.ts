@@ -61,7 +61,7 @@ export interface CacheConfig {
    * stale-while-revalidate and turns a refresh failure into an error.
    */
   staleWhileRevalidateMs?: number;
-  /** Maximum entries before the oldest are evicted. */
+  /** Maximum entries held; expired entries are evicted first under pressure. */
   maxEntries?: number;
   /** Read the current shared epoch. Returns null when unavailable. */
   readEpoch: () => Promise<number | null>;
@@ -93,7 +93,14 @@ export class ResponseCache {
   private evictions = 0;
   private refreshFailures = 0;
 
-  constructor(private readonly config: CacheConfig) {}
+  constructor(private readonly config: CacheConfig) {
+    if (
+      config.maxEntries !== undefined &&
+      (!Number.isSafeInteger(config.maxEntries) || config.maxEntries < 0)
+    ) {
+      throw new RangeError("maxEntries must be a non-negative safe integer");
+    }
+  }
 
   /**
    * Fetch a key, populating it on a miss.
@@ -226,16 +233,27 @@ export class ResponseCache {
     }
   }
 
-  /** Evict the oldest entry when over capacity. */
+  /** Evict expired entries first, then the oldest entry, until under capacity. */
   private evictIfNeeded(): void {
     const max = this.config.maxEntries ?? 1_000;
     while (this.entries.size > max) {
-      // Map preserves insertion order, so the first key is the oldest written.
-      // This is not true LRU — a frequently-read entry can still be evicted —
-      // which is acceptable for a cache whose entries are cheap to rebuild.
-      const oldest = this.entries.keys().next();
-      if (oldest.done) break;
-      this.entries.delete(oldest.value);
+      const now = Date.now();
+      let victim: string | undefined;
+      for (const [key, entry] of this.entries) {
+        if (entry.staleUntil <= now) {
+          victim = key;
+          break;
+        }
+      }
+
+      if (victim === undefined) {
+        // Map preserves insertion order. This is not true LRU — a frequently
+        // read entry can still be evicted — but cache entries are cheap to rebuild.
+        const oldest = this.entries.keys().next();
+        if (oldest.done) break;
+        victim = oldest.value;
+      }
+      this.entries.delete(victim);
       this.evictions += 1;
     }
   }

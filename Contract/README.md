@@ -17,11 +17,15 @@ The four Kovara Soroban contracts, as a reproducible Rust Cargo workspace:
 | ---------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------ |
 | `DataKey::Price(country, category, timestamp)` | Complete `PriceSubmission`, including price and audit metadata | Single-record reads (`get`, `get_valid`, `get_status`) |
 | `DataKey::SubmissionIndex(country, category)`  | `Vec<u64>` of observation timestamps                           | Grouped history and latest-record reads                |
+| `DataKey::SubmitterIndex(submitter)`           | `Vec<SubmitterEntry>` — `(country, category, timestamp)`       | Cursor-paginated per-submitter history reads           |
 
 The index timestamps point to `Price` keys in the same country/category scope.
 The observation timestamp is `valid_from`; duplicate submissions for the same
 composite key leave the original value and index entry unchanged. Keeping
 metadata inside `PriceSubmission` makes the record and its metadata atomic.
+
+`SubmitterIndex` is appended in the same transaction as the record and the
+group index, so the three views can never disagree about which records exist.
 
 Treat existing key variants and component types as persistent schema. For an
 incompatible layout change, add a versioned key and an explicit migration;
