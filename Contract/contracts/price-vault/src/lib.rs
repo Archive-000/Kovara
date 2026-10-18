@@ -1,17 +1,17 @@
 #![no_std]
 
-//! `PriceVault` — stores raw price submissions keyed by `(country_iso,
+//! `PriceVault` â€” stores raw price submissions keyed by `(country_iso,
 //! category, valid_from)`.
 //!
 //! A submission is a single cost-of-living observation (bread, rent, transport,
-//! …) made in a given country at a given moment. Each observation carries an
+//! â€¦) made in a given country at a given moment. Each observation carries an
 //! explicit **validity window** and moves through a strict **verification
 //! state machine** before it can be aggregated into the Kovara index.
 //!
 //! ```text
-//!                         ┌──────────────► Verified   (terminal)
-//!  submit() ──► Pending ──┤
-//!                         └──────────────► Rejected   (terminal)
+//!                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Verified   (terminal)
+//!  submit() â”€â”€â–º Pending â”€â”€â”¤
+//!                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Rejected   (terminal)
 //! ```
 //!
 //! # Design invariants
@@ -21,9 +21,9 @@
 //! Every rejection path in [`PriceVault::submit`] is a **pure** predicate over
 //! the caller's arguments. The order is fixed:
 //!
-//! 1. [`registry`] — the country and category must be known identifiers.
-//! 2. [`payload`] — the arguments must satisfy [`SUBMIT_SCHEMA`].
-//! 3. [`guards`] — arithmetic is checked, never assumed.
+//! 1. [`registry`] â€” the country and category must be known identifiers.
+//! 2. [`payload`] â€” the arguments must satisfy [`SUBMIT_SCHEMA`].
+//! 3. [`guards`] â€” arithmetic is checked, never assumed.
 //!
 //! Only then does the contract call `require_auth` and touch storage. A
 //! malformed call therefore costs the caller nothing beyond the validation it
@@ -32,8 +32,8 @@
 //! ## Validity windows
 //!
 //! ```text
-//! valid_from ──────────── valid_until
-//!     │                      │
+//! valid_from â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ valid_until
+//!     â”‚                      â”‚
 //!  earliest ledger ts     expiry ts (exclusive)
 //! ```
 //!
@@ -45,7 +45,7 @@
 //! ## Terminal states are terminal
 //!
 //! `Verified` and `Rejected` are absorbing. There is no path back to `Pending`
-//! and no path between them — see [`SubmissionStatus::can_transition_to`]. An
+//! and no path between them â€” see [`SubmissionStatus::can_transition_to`]. An
 //! attempt to leave a terminal state fails with [`Error::InvalidTransition`]
 //! and leaves the record byte-for-byte unchanged.
 //!
@@ -61,7 +61,7 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Default validity window: 24 hours expressed in seconds.
 ///
@@ -78,11 +78,20 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The ceiling bounds how far one rogue submission can skew an index median.
 pub const MAX_PRICE: i128 = 1_000_000_000_000;
 
-// ── Errors ───────────────────────────────────────────────────────────────────
+/// Largest page [`PriceVault::get_submitter_history`] will return.
+///
+/// An unbounded history read is a denial-of-service vector: a submitter with
+/// thousands of records would force a caller to pay for reading all of them in
+/// one transaction. The cap turns that into a bounded, predictable cost, and
+/// [`Error::InvalidPageSize`] makes an over-large request fail loudly rather
+/// than being silently truncated.
+pub const MAX_HISTORY_PAGE_SIZE: u32 = 50;
+
+// â”€â”€ Errors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Errors returned by `PriceVault`.
 ///
-/// Discriminants are contiguous from 1 and append-only — see the ABI note in
+/// Discriminants are contiguous from 1 and append-only â€” see the ABI note in
 /// the module docs.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -103,7 +112,7 @@ pub enum Error {
     /// No submission exists for the given key.
     NotFound = 7,
 
-    // ── payload schema ───────────────────────────────────────────────────
+    // â”€â”€ payload schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     /// A required field is missing.
     MissingRequiredField = 8,
     /// A field value is below its declared minimum.
@@ -119,7 +128,7 @@ pub enum Error {
     /// The payload's schema version is not the one this build understands.
     SchemaMismatch = 14,
 
-    // ── guards ──────────────────────────────────────────────────────────
+    // â”€â”€ guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     /// A price value was zero.
     ZeroPrice = 15,
     /// A price value was negative.
@@ -132,17 +141,21 @@ pub enum Error {
     ArithmeticOverflow = 19,
     /// A multiplication would overflow the target type.
     ArithmeticOverflowMul = 20,
+
+    // â”€â”€ bounded history queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A page size was zero or above [`MAX_HISTORY_PAGE_SIZE`].
+    InvalidPageSize = 21,
 }
 
-// ── Identifier registry ──────────────────────────────────────────────────────
+// â”€â”€ Identifier registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// The set of country and basket-category identifiers the protocol understands.
 ///
 /// The registry is deliberately **not** encoded in any storage key. Every stored
 /// record references an identifier by `Symbol`, and the identifier is checked
 /// against this registry at the contract boundary, so adding a country or a
-/// category later is a code change that leaves previously stored records — and
-/// their keys — untouched. Extending it therefore needs no storage migration
+/// category later is a code change that leaves previously stored records â€” and
+/// their keys â€” untouched. Extending it therefore needs no storage migration
 /// and cannot invalidate existing submissions.
 pub mod registry {
     use soroban_sdk::{Env, Symbol, Vec};
@@ -198,13 +211,13 @@ pub mod registry {
     }
 }
 
-// ── Fail-safe arithmetic guards ──────────────────────────────────────────────
+// â”€â”€ Fail-safe arithmetic guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Centralised arithmetic safety guards.
 ///
 /// Every guard is a pure function returning `Err` rather than panicking. A
 /// panic in a Soroban contract aborts the transaction without emitting an error
-/// code, burning caller fees and leaving no diagnosable trace — so overflow and
+/// code, burning caller fees and leaving no diagnosable trace â€” so overflow and
 /// bad input are always values, never faults.
 pub mod guards {
     use super::Error;
@@ -212,8 +225,8 @@ pub mod guards {
     /// Reject a price value that is zero or negative.
     ///
     /// # Errors
-    /// * [`Error::NegativePrice`] — `value < 0`
-    /// * [`Error::ZeroPrice`] — `value == 0`
+    /// * [`Error::NegativePrice`] â€” `value < 0`
+    /// * [`Error::ZeroPrice`] â€” `value == 0`
     #[inline]
     pub fn require_positive_price(value: i128) -> Result<(), Error> {
         if value < 0 {
@@ -228,7 +241,7 @@ pub mod guards {
     /// Reject a `u64` value that is zero.
     ///
     /// # Errors
-    /// * [`Error::ZeroValue`] — `value == 0`
+    /// * [`Error::ZeroValue`] â€” `value == 0`
     #[inline]
     pub fn require_positive_u64(value: u64) -> Result<(), Error> {
         if value == 0 {
@@ -240,7 +253,7 @@ pub mod guards {
     /// Reject an `i128` amount that is zero or negative.
     ///
     /// # Errors
-    /// * [`Error::NonPositiveAmount`] — `amount <= 0`
+    /// * [`Error::NonPositiveAmount`] â€” `amount <= 0`
     #[inline]
     pub fn require_positive_i128(amount: i128) -> Result<(), Error> {
         if amount <= 0 {
@@ -252,7 +265,7 @@ pub mod guards {
     /// Checked `u64` addition.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — the result would exceed `u64::MAX`.
+    /// * [`Error::ArithmeticOverflow`] â€” the result would exceed `u64::MAX`.
     #[inline]
     pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
         a.checked_add(b).ok_or(Error::ArithmeticOverflow)
@@ -261,7 +274,7 @@ pub mod guards {
     /// Checked `i128` addition.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — the result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflow`] â€” the result would overflow `i128`.
     #[inline]
     pub fn checked_add_i128(a: i128, b: i128) -> Result<i128, Error> {
         a.checked_add(b).ok_or(Error::ArithmeticOverflow)
@@ -270,14 +283,14 @@ pub mod guards {
     /// Checked `i128` multiplication.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflowMul`] — the result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflowMul`] â€” the result would overflow `i128`.
     #[inline]
     pub fn checked_mul_i128(a: i128, b: i128) -> Result<i128, Error> {
         a.checked_mul(b).ok_or(Error::ArithmeticOverflowMul)
     }
 }
 
-// ── Payload schema validation ────────────────────────────────────────────────
+// â”€â”€ Payload schema validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Schema validation for external payloads.
 ///
@@ -304,7 +317,7 @@ pub mod payload {
     /// A single named constraint applied to a payload field.
     ///
     /// Constraints are evaluated in declaration order and the first failure
-    /// returns immediately — there is no error accumulation, which is how
+    /// returns immediately â€” there is no error accumulation, which is how
     /// Soroban contracts communicate a single failure to a caller.
     #[derive(Copy, Clone, Debug)]
     pub enum Constraint {
@@ -406,13 +419,13 @@ pub const SUBMIT_SCHEMA: &[payload::Constraint] = &[
     payload::Constraint::SchemaVersion(SCHEMA_VERSION),
 ];
 
-// ── Submission status ────────────────────────────────────────────────────────
+// â”€â”€ Submission status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Lifecycle state of a single price submission.
 ///
 /// ```text
-/// Pending ──► Verified   (terminal)
-///         └─► Rejected   (terminal)
+/// Pending â”€â”€â–º Verified   (terminal)
+///         â””â”€â–º Rejected   (terminal)
 /// ```
 ///
 /// Consumers matching on status should match exhaustively on all three
@@ -455,25 +468,63 @@ impl SubmissionStatus {
     }
 }
 
-// ── Storage keys ─────────────────────────────────────────────────────────────
+// â”€â”€ Storage keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    /// `(country_iso, category, valid_from)` → [`PriceSubmission`].
+    /// `(country_iso, category, valid_from)` â†’ [`PriceSubmission`].
     ///
     /// `valid_from` is the observation timestamp; it is both the storage key
     /// component and the start of the validity window.
     Price(Symbol, Symbol, u64),
 
-    /// `(country_iso, category)` → `Vec<u64>` of observation timestamps, in
+    /// `(country_iso, category)` â†’ `Vec<u64>` of observation timestamps, in
     /// insertion order.
     ///
     /// Lets history queries enumerate records without a full-storage scan.
     SubmissionIndex(Symbol, Symbol),
+
+    /// `submitter` â†’ `Vec<SubmitterEntry>` for that submitter's records, in
+    /// insertion order.
+    ///
+    /// Appended at the same moment as [`DataKey::SubmissionIndex`], so the two
+    /// can never disagree about which records exist. See
+    /// [`PriceVault::get_submitter_history`] for why this exists.
+    SubmitterIndex(Address),
 }
 
-// ── Domain types ─────────────────────────────────────────────────────────────
+/// One of a submitter's records, addressed well enough to reload it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmitterEntry {
+    /// Country the observation belongs to.
+    pub country_iso: Symbol,
+    /// Basket category.
+    pub category: Symbol,
+    /// Observation timestamp (the `valid_from` component of the `Price` key).
+    pub timestamp: u64,
+}
+
+/// One bounded page of a submitter's history.
+///
+/// The cursor is an **offset into an append-only index**, which is what makes
+/// pagination stable: appending new records never shifts the position of an
+/// existing one, so a caller holding `next_cursor` can resume after a gap
+/// without having seen any record twice or skipped one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    /// The records in this page, in insertion order.
+    pub submissions: Vec<PriceSubmission>,
+    /// Cursor to pass to fetch the page after this one. Equal to the number of
+    /// index entries consumed so far.
+    pub next_cursor: u32,
+    /// Whether any entry remains after this page.
+    pub has_more: bool,
+}
+
+// â”€â”€ Domain types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// A single raw price submission with an attached validity window.
 ///
@@ -512,12 +563,12 @@ impl PriceSubmission {
     }
 }
 
-// ── Events ───────────────────────────────────────────────────────────────────
+// â”€â”€ Events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Emitted after a price submission is recorded.
 ///
-/// `country_iso` and `category` are **topics** — the two dimensions an indexer
-/// filters on — so a consumer can subscribe to just the submissions it cares
+/// `country_iso` and `category` are **topics** â€” the two dimensions an indexer
+/// filters on â€” so a consumer can subscribe to just the submissions it cares
 /// about without decoding every body. The body carries the rest of the
 /// metadata so an indexer can build its record from the event alone.
 ///
@@ -527,10 +578,10 @@ impl PriceSubmission {
 #[contractevent]
 #[derive(Clone)]
 pub struct PriceSubmitted {
-    /// Topic — the country this observation belongs to.
+    /// Topic â€” the country this observation belongs to.
     #[topic]
     pub country_iso: Symbol,
-    /// Topic — the basket category.
+    /// Topic â€” the basket category.
     #[topic]
     pub category: Symbol,
     /// The submitting oracle/operator.
@@ -547,14 +598,51 @@ pub struct PriceSubmitted {
     pub schema_version: u32,
 }
 
-// ── Contract ─────────────────────────────────────────────────────────────────
+/// Emitted after a submission's status changes.
+///
+/// # What an indexer needs
+///
+/// A consumer that tracks verification state has to know *which* record moved,
+/// *from where* it moved, and *who* was authorised to move it. All three are in
+/// this event: the record is addressed by `country_iso` (topic), `category`
+/// (topic) and `timestamp`; `prior_status` and `new_status` give the
+/// transition; `actor` is the address whose `require_auth` authorised it.
+///
+/// Without `prior_status` an indexer can only report the new state and cannot
+/// distinguish a `Verified` record from one that was already `Verified`. Without
+/// `actor` it cannot attribute the change to a verifier at all â€” which is the
+/// part an audit actually needs.
+///
+/// Published only after the record has been written, so a consumer reacting to
+/// the event can read the new status back immediately. A refused transition
+/// emits nothing.
+#[contractevent]
+#[derive(Clone)]
+pub struct StatusChanged {
+    /// Topic â€” the country this record belongs to.
+    #[topic]
+    pub country_iso: Symbol,
+    /// Topic â€” the basket category.
+    #[topic]
+    pub category: Symbol,
+    /// Observation timestamp: the third component of the record's key.
+    pub timestamp: u64,
+    /// The address whose authorisation allowed the transition.
+    pub actor: Address,
+    /// Status the record held before this change.
+    pub prior_status: SubmissionStatus,
+    /// Status the record holds after this change.
+    pub new_status: SubmissionStatus,
+}
+
+// â”€â”€ Contract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[contract]
 pub struct PriceVault;
 
 #[contractimpl]
 impl PriceVault {
-    // ── Mutating entry points ───────────────────────────────────────────
+    // â”€â”€ Mutating entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// # Record a raw price submission
     ///
@@ -564,20 +652,20 @@ impl PriceVault {
     /// observations.
     ///
     /// Validation order is fixed and every step before auth is a pure
-    /// predicate — see the module docs. If a record already exists for the same
+    /// predicate â€” see the module docs. If a record already exists for the same
     /// `(country_iso, category, valid_from)` triple the call is a **no-op**:
     /// the original is kept and the index is not duplicated, so replaying a
     /// transaction can never corrupt the historical index.
     ///
     /// # Errors
-    /// * [`Error::InvalidCountry`] — country is not a registry identifier.
-    /// * [`Error::InvalidCategory`] — category is not a registry identifier.
-    /// * [`Error::ZeroNotAllowed`] — `valid_from` or `value` is zero.
-    /// * [`Error::NegativeNotAllowed`] — `value` is negative.
-    /// * [`Error::ValueAboveMaximum`] — `value` exceeds [`MAX_PRICE`].
-    /// * [`Error::EmptySymbol`] — country or category is empty.
-    /// * [`Error::SchemaMismatch`] — caller expects another schema version.
-    /// * [`Error::InvalidWindow`] — zero window, or `valid_from + window`
+    /// * [`Error::InvalidCountry`] â€” country is not a registry identifier.
+    /// * [`Error::InvalidCategory`] â€” category is not a registry identifier.
+    /// * [`Error::ZeroNotAllowed`] â€” `valid_from` or `value` is zero.
+    /// * [`Error::NegativeNotAllowed`] â€” `value` is negative.
+    /// * [`Error::ValueAboveMaximum`] â€” `value` exceeds [`MAX_PRICE`].
+    /// * [`Error::EmptySymbol`] â€” country or category is empty.
+    /// * [`Error::SchemaMismatch`] â€” caller expects another schema version.
+    /// * [`Error::InvalidWindow`] â€” zero window, or `valid_from + window`
     ///   overflows `u64`.
     pub fn submit(
         env: Env,
@@ -588,7 +676,7 @@ impl PriceVault {
         valid_from: u64,
         validity_window_secs: u64,
     ) -> Result<(), Error> {
-        // 1. Identifier registry — pure, before auth and before storage.
+        // 1. Identifier registry â€” pure, before auth and before storage.
         if !registry::is_supported_country(&env, &country_iso) {
             return Err(Error::InvalidCountry);
         }
@@ -596,7 +684,7 @@ impl PriceVault {
             return Err(Error::InvalidCategory);
         }
 
-        // 2. Payload schema — pure, before auth and before storage.
+        // 2. Payload schema â€” pure, before auth and before storage.
         payload::validate(
             SUBMIT_SCHEMA,
             &payload::SubmitPayload {
@@ -608,7 +696,7 @@ impl PriceVault {
             },
         )?;
 
-        // 3. Guards — defence in depth for the price itself.
+        // 3. Guards â€” defence in depth for the price itself.
         guards::require_positive_price(value)?;
 
         // Validity window. Zero or overflowing windows are rejected rather
@@ -656,6 +744,23 @@ impl PriceVault {
         index.push_back(valid_from);
         env.storage().persistent().set(&idx_key, &index);
 
+        // Append to the per-submitter index so a submitter's own history is
+        // reachable without scanning every (country, category) pair. Written in
+        // the same transaction as the record and the group index, so the three
+        // views cannot disagree about which records exist.
+        let sub_key = DataKey::SubmitterIndex(submitter.clone());
+        let mut sub_index: Vec<SubmitterEntry> = env
+            .storage()
+            .persistent()
+            .get(&sub_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        sub_index.push_back(SubmitterEntry {
+            country_iso: country_iso.clone(),
+            category: category.clone(),
+            timestamp: valid_from,
+        });
+        env.storage().persistent().set(&sub_key, &sub_index);
+
         PriceSubmitted {
             country_iso,
             category,
@@ -680,8 +785,8 @@ impl PriceVault {
     /// The record is left byte-for-byte unchanged when a transition is refused.
     ///
     /// # Errors
-    /// * [`Error::NotFound`] — no submission for the given key.
-    /// * [`Error::InvalidTransition`] — `new_status` is `Pending`, or the
+    /// * [`Error::NotFound`] â€” no submission for the given key.
+    /// * [`Error::InvalidTransition`] â€” `new_status` is `Pending`, or the
     ///   current status is already terminal.
     pub fn set_status(
         env: Env,
@@ -705,17 +810,31 @@ impl PriceVault {
             return Err(Error::InvalidTransition);
         }
 
+        let prior_status = submission.status;
         submission.status = new_status;
         env.storage().persistent().set(&key, &submission);
+
+        // Published after the write, so a consumer reacting to the event can
+        // read the new status back. A refused transition returns above and
+        // emits nothing.
+        StatusChanged {
+            country_iso,
+            category,
+            timestamp,
+            actor: verifier,
+            prior_status,
+            new_status,
+        }
+        .publish(&env);
 
         Ok(())
     }
 
-    // ── Read entry points ───────────────────────────────────────────────
+    // â”€â”€ Read entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Read a stored submission by its exact composite key.
     ///
-    /// Returns the record regardless of whether it is currently fresh — use
+    /// Returns the record regardless of whether it is currently fresh â€” use
     /// [`Self::get_valid`] to gate on the validity window.
     pub fn get(
         env: Env,
@@ -792,7 +911,7 @@ impl PriceVault {
     /// All submissions for `(country_iso, category)`, in insertion order.
     ///
     /// Deterministic: identical contract state always produces an identical
-    /// sequence. Returns an empty `Vec` when there are none — never panics.
+    /// sequence. Returns an empty `Vec` when there are none â€” never panics.
     /// For bounded reads prefer [`Self::get_history_range`].
     pub fn get_history(
         env: Env,
@@ -813,7 +932,7 @@ impl PriceVault {
     /// insertion order. Both bounds are inclusive.
     ///
     /// # Errors
-    /// * [`Error::InvalidRange`] — `from_ts > to_ts`.
+    /// * [`Error::InvalidRange`] â€” `from_ts > to_ts`.
     pub fn get_history_range(
         env: Env,
         country_iso: Symbol,
@@ -864,7 +983,69 @@ impl PriceVault {
             .get(&DataKey::Price(country_iso, category, latest_ts))
     }
 
-    // ── Registry views ──────────────────────────────────────────────────
+    /// # One bounded page of a submitter's records
+    ///
+    /// Returns at most [`MAX_HISTORY_PAGE_SIZE`] records starting at `cursor`
+    /// in [`DataKey::SubmitterIndex`].
+    ///
+    /// `cursor` is an **offset into an append-only index**, which is what makes
+    /// pagination stable: new submissions are appended, so an offset already
+    /// handed to a caller keeps pointing at the same position. A caller paging
+    /// through history therefore never sees a record twice and never skips one
+    /// just because another submission landed mid-pagination.
+    ///
+    /// An index entry whose record has since been removed is skipped rather
+    /// than failing the whole page.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidPageSize`] â€” `limit` is zero or above
+    ///   [`MAX_HISTORY_PAGE_SIZE`].
+    pub fn get_submitter_history(
+        env: Env,
+        submitter: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> Result<HistoryPage, Error> {
+        if limit == 0 || limit > MAX_HISTORY_PAGE_SIZE {
+            return Err(Error::InvalidPageSize);
+        }
+
+        let sub_key = DataKey::SubmitterIndex(submitter);
+        let entries: Vec<SubmitterEntry> = env
+            .storage()
+            .persistent()
+            .get(&sub_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = entries.len();
+        // A cursor past the end yields an empty final page rather than an
+        // error, so a caller that races a concurrent submission still
+        // terminates.
+        let start = if cursor > total { total } else { cursor };
+        let end = core::cmp::min(start.saturating_add(limit), total);
+
+        let mut submissions = Vec::new(&env);
+        for i in start..end {
+            let entry = entries.get(i).unwrap();
+            let key = DataKey::Price(
+                entry.country_iso.clone(),
+                entry.category.clone(),
+                entry.timestamp,
+            );
+            if let Some(submission) = env.storage().persistent().get::<DataKey, PriceSubmission>(&key)
+            {
+                submissions.push_back(submission);
+            }
+        }
+
+        Ok(HistoryPage {
+            submissions,
+            next_cursor: end,
+            has_more: end < total,
+        })
+    }
+
+    // â”€â”€ Registry views â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// The supported ISO 3166-1 alpha-2 country codes.
     pub fn supported_countries(env: Env) -> Vec<Symbol> {
@@ -881,12 +1062,12 @@ impl PriceVault {
         registry::VERSION
     }
 
-    // ── Pure helpers, callable off-chain ────────────────────────────────
+    // â”€â”€ Pure helpers, callable off-chain â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Add two `i128` values, failing safely on overflow.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflow`] — result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflow`] â€” result would overflow `i128`.
     pub fn safe_add(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
         guards::checked_add_i128(a, b)
     }
@@ -894,7 +1075,7 @@ impl PriceVault {
     /// Multiply two `i128` values, failing safely on overflow.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflowMul`] — result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflowMul`] â€” result would overflow `i128`.
     pub fn safe_mul(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
         guards::checked_mul_i128(a, b)
     }
@@ -922,10 +1103,10 @@ impl PriceVault {
         )
     }
 
-    // ── Internal ────────────────────────────────────────────────────────
+    // â”€â”€ Internal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Load records for each timestamp in `timestamps`, skipping any that are
-    /// absent (defensive — under normal operation every indexed timestamp has
+    /// absent (defensive â€” under normal operation every indexed timestamp has
     /// a record).
     fn collect_submissions(
         env: &Env,
@@ -945,7 +1126,7 @@ impl PriceVault {
     }
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
@@ -986,7 +1167,7 @@ mod tests {
             .unwrap();
     }
 
-    // ── guards ──────────────────────────────────────────────────────────
+    // â”€â”€ guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn guard_price_bounds() {
@@ -1049,7 +1230,7 @@ mod tests {
         );
     }
 
-    // ── payload validate ────────────────────────────────────────────────
+    // â”€â”€ payload validate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn payload<'a>(
         country: &'a Symbol,
@@ -1097,7 +1278,7 @@ mod tests {
         assert!(payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, MAX_PRICE, 1)).is_ok());
     }
 
-    // ── registry ────────────────────────────────────────────────────────
+    // â”€â”€ registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn registry_recognises_known_identifiers() {
@@ -1111,7 +1292,7 @@ mod tests {
         assert_eq!(registry::categories(&env).len(), registry::CATEGORIES.len());
     }
 
-    // ── submit ──────────────────────────────────────────────────────────
+    // â”€â”€ submit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn submit_stores_window_bounds_and_pending_status() {
@@ -1285,7 +1466,7 @@ mod tests {
         assert_eq!(history.get(0).unwrap().value, 100);
     }
 
-    // ── validity window ─────────────────────────────────────────────────
+    // â”€â”€ validity window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn validity_window_bounds_are_half_open() {
@@ -1371,7 +1552,7 @@ mod tests {
         assert!(!client.is_valid_at(&sym(&env, "NG"), &sym(&env, "Food"), &1, &1));
     }
 
-    // ── status machine ──────────────────────────────────────────────────
+    // â”€â”€ status machine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn transition_table_allows_only_pending_to_a_terminal_state() {
@@ -1537,7 +1718,7 @@ mod tests {
         assert_eq!(after.submitter, submitter);
     }
 
-    // ── history ─────────────────────────────────────────────────────────
+    // â”€â”€ history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn history_is_empty_when_there_are_no_submissions() {
@@ -1698,7 +1879,126 @@ mod tests {
         }
     }
 
-    // ── pure helpers ────────────────────────────────────────────────────
+    // â”€â”€ bounded submitter history (#885) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    /// Submit `count` records for one submitter, spreading them over countries
+    /// so the submitter index is genuinely cross-group.
+    fn seed_submitter(env: &Env, client: &PriceVaultClient, submitter: &Address, count: u32) {
+        let countries = ["NG", "KE", "BR"];
+        for i in 0..count {
+            client
+                .submit(
+                    submitter,
+                    &Symbol::new(env, countries[(i % 3) as usize]),
+                    &Symbol::new(env, "Food"),
+                    &((i as i128) + 1),
+                    &((i as u64) * 10 + 10),
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn submitter_history_pages_through_every_record_exactly_once() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let other = Address::generate(&env);
+        env.mock_all_auths();
+
+        seed_submitter(&env, &client, &submitter, 7);
+        // A second submitter must not appear in the first one's history.
+        seed_submitter(&env, &client, &other, 2);
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cursor: u32 = 0;
+        loop {
+            let page = client.get_submitter_history(&submitter, &cursor, &3).unwrap();
+            for record in page.submissions.iter() {
+                seen.push_back(record.timestamp);
+            }
+            assert!(page.submissions.len() <= 3);
+            if !page.has_more {
+                // An exhausted cursor terminates the walk.
+                assert_eq!(page.next_cursor, 7);
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        assert_eq!(seen.len(), 7);
+        // Append-only ordering, and no duplicates from the paging.
+        let mut expected: Vec<u64> = Vec::new();
+        for i in 0..7u64 {
+            expected.push_back(i * 10 + 10);
+        }
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn submitter_history_rejects_an_out_of_range_page_size() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_get_submitter_history(&submitter, &0, &0)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidPageSize
+        );
+        assert_eq!(
+            client
+                .try_get_submitter_history(&submitter, &0, &(MAX_HISTORY_PAGE_SIZE + 1))
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidPageSize
+        );
+    }
+
+    #[test]
+    fn submitter_history_cursor_is_stable_when_new_records_land() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        seed_submitter(&env, &client, &submitter, 4);
+
+        // Read the first page, then let more records land mid-pagination.
+        let first = client.get_submitter_history(&submitter, &0, &2).unwrap();
+        assert_eq!(first.submissions.len(), 2);
+        assert!(first.has_more);
+
+        seed_submitter(&env, &client, &submitter, 2);
+
+        // Resuming from the cursor we were handed still reads forward, and the
+        // records we already saw are not repeated.
+        let second = client
+            .get_submitter_history(&submitter, &first.next_cursor, &10)
+            .unwrap();
+        assert_eq!(second.submissions.len(), 4);
+        for record in second.submissions.iter() {
+            assert!(record.timestamp > 30);
+        }
+    }
+
+    #[test]
+    fn submitter_history_is_empty_for_an_unknown_submitter() {
+        let env = make_env();
+        let client = deploy(&env);
+        let page = client
+            .get_submitter_history(&Address::generate(&env), &0, &10)
+            .unwrap();
+        assert_eq!(page.submissions.len(), 0);
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, 0);
+    }
+
+    // â”€â”€ pure helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn safe_arithmetic_entry_points() {
@@ -1735,7 +2035,7 @@ mod tests {
         assert!(client.get(&sym(&env, "KE"), &sym(&env, "Rent"), &50).is_none());
     }
 
-    // ── constants ───────────────────────────────────────────────────────
+    // â”€â”€ constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn documented_constants_hold() {
