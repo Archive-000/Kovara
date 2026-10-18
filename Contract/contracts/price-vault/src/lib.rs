@@ -145,6 +145,22 @@ pub enum Error {
     // â”€â”€ bounded history queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     /// A page size was zero or above [`MAX_HISTORY_PAGE_SIZE`].
     InvalidPageSize = 21,
+
+    // â”€â”€ duplicate submissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// A record already exists for `(country_iso, category, valid_from)`.
+    DuplicateSubmission = 22,
+
+    // â”€â”€ admin configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    /// The caller is not the configured admin.
+    Unauthorized = 23,
+    /// The category is disabled by the configured policy.
+    CategoryDisabled = 24,
+    /// The submitter is not allowed by the configured policy.
+    SubmitterNotAllowed = 25,
+    /// The requested validity window exceeds the configured maximum.
+    WindowTooLong = 26,
+    /// An admin configuration call was made before any admin was configured.
+    AdminNotConfigured = 27,
 }
 
 // â”€â”€ Identifier registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -492,6 +508,20 @@ pub enum DataKey {
     /// can never disagree about which records exist. See
     /// [`PriceVault::get_submitter_history`] for why this exists.
     SubmitterIndex(Address),
+
+    /// The address authorized to change the configuration below.
+    ///
+    /// Absent means unconfigured. The lookup has no fallback to the caller.
+    Admin,
+
+    /// Longest validity window `submit` will accept. `None` = unbounded.
+    MaxValidityWindow,
+
+    /// `category` â†’ whether submissions are accepted. Absent = enabled.
+    CategoryPolicy(Symbol),
+
+    /// `submitter` â†’ whether submissions are accepted. Absent = allowed.
+    SubmitterPolicy(Address),
 }
 
 /// One of a submitter's records, addressed well enough to reload it.
@@ -637,6 +667,42 @@ pub struct StatusChanged {
 
 // â”€â”€ Contract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+/// Emitted when the configured maximum validity window changes.
+#[contractevent]
+#[derive(Clone)]
+pub struct ValidityWindowPolicyUpdated {
+    #[topic]
+    pub actor: Address,
+    /// The new maximum, or `None` meaning unbounded.
+    pub max_validity_window_secs: Option<u64>,
+}
+
+/// Emitted when a category is enabled or disabled.
+#[contractevent]
+#[derive(Clone)]
+pub struct CategoryPolicyUpdated {
+    #[topic]
+    pub actor: Address,
+    /// Topic - the category the policy entry is for.
+    #[topic]
+    pub category: Symbol,
+    /// Whether submissions in this category are accepted after this change.
+    pub enabled: bool,
+}
+
+/// Emitted when a submitter is allowed or denied.
+#[contractevent]
+#[derive(Clone)]
+pub struct SubmitterPolicyUpdated {
+    #[topic]
+    pub actor: Address,
+    /// Topic - the submitter the policy entry is for.
+    #[topic]
+    pub submitter: Address,
+    /// Whether this submitter may submit after this change.
+    pub allowed: bool,
+}
+
 #[contract]
 pub struct PriceVault;
 
@@ -653,9 +719,11 @@ impl PriceVault {
     ///
     /// Validation order is fixed and every step before auth is a pure
     /// predicate â€” see the module docs. If a record already exists for the same
-    /// `(country_iso, category, valid_from)` triple the call is a **no-op**:
-    /// the original is kept and the index is not duplicated, so replaying a
-    /// transaction can never corrupt the historical index.
+    /// `(country_iso, category, valid_from)` triple the call is **refused** with
+    /// [`Error::DuplicateSubmission`]: the key is occupied, the original is kept,
+    /// and the index is not duplicated. The failure is explicit because a silent
+    /// success is indistinguishable, to a caller and to an indexer alike, from a
+    /// genuine first write.
     ///
     /// # Errors
     /// * [`Error::InvalidCountry`] â€” country is not a registry identifier.
@@ -667,6 +735,10 @@ impl PriceVault {
     /// * [`Error::SchemaMismatch`] â€” caller expects another schema version.
     /// * [`Error::InvalidWindow`] â€” zero window, or `valid_from + window`
     ///   overflows `u64`.
+    /// * [`Error::CategoryDisabled`] - the category is disabled by policy.
+    /// * [`Error::SubmitterNotAllowed`] - the submitter is denied by policy.
+    /// * [`Error::WindowTooLong`] - the window exceeds the configured maximum.
+    /// * [`Error::DuplicateSubmission`] - the key is occupied.
     pub fn submit(
         env: Env,
         submitter: Address,
@@ -702,21 +774,32 @@ impl PriceVault {
         // Validity window. Zero or overflowing windows are rejected rather
         // than clamped: a clamped window would silently disagree with the
         // submitter's intent about how fresh the observation is.
-        if validity_window_secs == 0 {
-            return Err(Error::InvalidWindow);
+        let valid_until = Self::resolve_window(valid_from, validity_window_secs)?;
+
+        // 4. Admin policy - pure lookups, still before auth and storage. Absent
+        //    entries mean "no restriction", so an unconfigured vault behaves
+        //    exactly as it did before the policy existed.
+        if !Self::is_category_enabled(env.clone(), category.clone()) {
+            return Err(Error::CategoryDisabled);
         }
-        let valid_until = valid_from
-            .checked_add(validity_window_secs)
-            .ok_or(Error::InvalidWindow)?;
+        if !Self::is_submitter_allowed(env.clone(), submitter.clone()) {
+            return Err(Error::SubmitterNotAllowed);
+        }
+        if let Some(max) = Self::max_validity_window(env.clone()) {
+            if validity_window_secs > max {
+                return Err(Error::WindowTooLong);
+            }
+        }
 
         // Auth comes after every pure check.
         submitter.require_auth();
 
         let key = DataKey::Price(country_iso.clone(), category.clone(), valid_from);
 
-        // Idempotent replay: keep the first write, emit nothing.
+        // The key is occupied. Refuse rather than silently succeeding: a caller
+        // cannot tell "written" from "ignored", and neither can an indexer.
         if env.storage().persistent().has(&key) {
-            return Ok(());
+            return Err(Error::DuplicateSubmission);
         }
 
         env.storage().persistent().set(
@@ -871,11 +954,48 @@ impl PriceVault {
         }
     }
 
-    /// Whether a stored submission is fresh at `query_ts`.
+    /// The exclusive expiry ledger for a submission window.
     ///
-    /// Returns `false` (not an error) for missing records so callers can use a
-    /// plain boolean gate without matching on `Option`.
-    pub fn is_valid_at(
+    /// One definition of the window, reachable off-chain and usable by
+    /// cross-contract callers before a transaction is built.
+    ///
+    /// # Errors
+    /// * [`Error::InvalidWindow`] - `validity_window_secs` is zero, or
+    ///   `valid_from + validity_window_secs` overflows `u64`.
+    pub fn window_bounds(
+        _env: Env,
+        valid_from: u64,
+        validity_window_secs: u64,
+    ) -> Result<u64, Error> {
+        Self::resolve_window(valid_from, validity_window_secs)
+    }
+
+    /// `valid_from + validity_window_secs`, refusing rather than clamping.
+    ///
+    /// A zero window is refused rather than treated as instantaneous: the
+    /// record would be born already stale, and the submitter's stated intent
+    /// about freshness would be silently discarded. An overflowing sum is
+    /// refused rather than wrapped or saturated, because both would produce a
+    /// window nobody asked for.
+    fn resolve_window(valid_from: u64, validity_window_secs: u64) -> Result<u64, Error> {
+        if validity_window_secs == 0 {
+            return Err(Error::InvalidWindow);
+        }
+
+        valid_from
+            .checked_add(validity_window_secs)
+            .ok_or(Error::InvalidWindow)
+    }
+
+    /// # Is the stored submission fresh at `query_ts`?
+    ///
+    /// The canonical freshness predicate: `valid_from <= query_ts < valid_until`.
+    /// Lower bound inclusive, upper bound exclusive, so consecutive
+    /// non-overlapping windows never both claim a ledger.
+    ///
+    /// A missing record is `false`, not an error - callers use this as a plain
+    /// boolean gate and should not have to match on `Option` first.
+    pub fn is_fresh(
         env: Env,
         country_iso: Symbol,
         category: Symbol,
@@ -890,6 +1010,47 @@ impl PriceVault {
             Some(s) => s.is_valid_at(query_ts),
             None => false,
         }
+    }
+
+    /// Every submission for `(country_iso, category)` that is fresh at
+    /// `query_ts`, in insertion order.
+    ///
+    /// The read aggregation code should call. [`Self::get_history`] returns
+    /// everything, expired records included, which is what an audit wants and
+    /// exactly what an index must not consume: a stale observation silently
+    /// folded into a median is a wrong index value with no error anywhere.
+    ///
+    /// Expired entries are skipped rather than failing the read; a caller can
+    /// always reconcile against [`Self::get_history`].
+    pub fn get_fresh_history(
+        env: Env,
+        country_iso: Symbol,
+        category: Symbol,
+        query_ts: u64,
+    ) -> Vec<PriceSubmission> {
+        let all = Self::get_history(env.clone(), country_iso.clone(), category.clone());
+
+        let mut fresh = Vec::new(&env);
+        for submission in all.iter() {
+            if submission.is_valid_at(query_ts) {
+                fresh.push_back(submission);
+            }
+        }
+        fresh
+    }
+
+    /// Whether a stored submission is fresh at `query_ts`.
+    ///
+    /// Returns `false` (not an error) for missing records so callers can use a
+    /// plain boolean gate without matching on `Option`.
+    pub fn is_valid_at(
+        env: Env,
+        country_iso: Symbol,
+        category: Symbol,
+        valid_from: u64,
+        query_ts: u64,
+    ) -> bool {
+        Self::is_fresh(env, country_iso, category, valid_from, query_ts)
     }
 
     /// Read just the lifecycle state of a submission, if present.
@@ -1048,6 +1209,162 @@ impl PriceVault {
     // â”€â”€ Registry views â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// The supported ISO 3166-1 alpha-2 country codes.
+    // Admin configuration ---------------------------------------------------
+    //
+    // Every setter below is admin-only and emits an event, so a change to what
+    // the vault accepts is visible in the ledger rather than only in storage.
+    // The three policies are independent and opt-in: an address, a category or
+    // a window with no entry carries no restriction, so a deployment that
+    // configures nothing behaves exactly as it did before these setters
+    // existed.
+
+    /// Configure the admin address.
+    ///
+    /// One-shot: a second call is refused so the authority cannot be handed to
+    /// a new address without a visible, deliberate act.
+    ///
+    /// # Errors
+    /// * [`Error::AdminNotConfigured`] - an admin is already configured.
+    pub fn configure_admin(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        if env.storage().persistent().has(&DataKey::Admin) {
+            return Err(Error::AdminNotConfigured);
+        }
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Ok(())
+    }
+
+    /// The configured admin, or `None`.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::Admin)
+    }
+
+    /// Fail unless `actor` is the configured admin.
+    ///
+    /// The lookup has no fallback to the caller: an unconfigured vault cannot be
+    /// reconfigured by whoever signs the transaction.
+    fn require_admin(env: &Env, actor: &Address) -> Result<(), Error> {
+        let stored: Option<Address> = env.storage().persistent().get(&DataKey::Admin);
+        match stored {
+            Some(admin) if admin == *actor => Ok(()),
+            _ => Err(Error::Unauthorized),
+        }
+    }
+
+    /// # Bound how long a submission may claim to be fresh
+    ///
+    /// `max_validity_window_secs = None` removes the bound. `submit` refuses a
+    /// longer window with [`Error::WindowTooLong`]; without a bound, a single
+    /// submission can stay "fresh" for years and quietly dominate every index
+    /// that reads it.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] - `actor` is not the configured admin.
+    pub fn set_max_validity_window(
+        env: Env,
+        actor: Address,
+        max_validity_window_secs: Option<u64>,
+    ) -> Result<(), Error> {
+        actor.require_auth();
+        Self::require_admin(&env, &actor)?;
+
+        match max_validity_window_secs {
+            Some(max) => {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::MaxValidityWindow, &max);
+            }
+            None => {
+                env.storage().persistent().remove(&DataKey::MaxValidityWindow);
+            }
+        }
+
+        ValidityWindowPolicyUpdated {
+            actor,
+            max_validity_window_secs,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// The configured maximum validity window, or `None` when unbounded.
+    pub fn max_validity_window(env: Env) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::MaxValidityWindow)
+    }
+
+    /// # Enable or disable a category
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] - `actor` is not the configured admin.
+    pub fn set_category_enabled(
+        env: Env,
+        actor: Address,
+        category: Symbol,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        actor.require_auth();
+        Self::require_admin(&env, &actor)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CategoryPolicy(category.clone()), &enabled);
+
+        CategoryPolicyUpdated {
+            actor,
+            category,
+            enabled,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Whether submissions in `category` are accepted. No entry means enabled.
+    pub fn is_category_enabled(env: Env, category: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CategoryPolicy(category))
+            .unwrap_or(true)
+    }
+
+    /// # Allow or deny a submitter
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] - `actor` is not the configured admin.
+    pub fn set_submitter_allowed(
+        env: Env,
+        actor: Address,
+        submitter: Address,
+        allowed: bool,
+    ) -> Result<(), Error> {
+        actor.require_auth();
+        Self::require_admin(&env, &actor)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubmitterPolicy(submitter.clone()), &allowed);
+
+        SubmitterPolicyUpdated {
+            actor,
+            submitter,
+            allowed,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Whether `submitter` may submit. No entry means allowed.
+    pub fn is_submitter_allowed(env: Env, submitter: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SubmitterPolicy(submitter))
+            .unwrap_or(true)
+    }
+
     pub fn supported_countries(env: Env) -> Vec<Symbol> {
         registry::countries(&env)
     }
@@ -1131,7 +1448,10 @@ impl PriceVault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _},
+        Env,
+    };
 
     fn make_env() -> Env {
         Env::default()
@@ -1450,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn resubmitting_the_same_key_is_a_no_op() {
+    fn resubmitting_the_same_key_is_refused() {
         let env = make_env();
         let client = deploy(&env);
         let submitter = Address::generate(&env);
@@ -1459,11 +1779,420 @@ mod tests {
         env.mock_all_auths();
 
         submit_ok(&client, &submitter, &country, &category, 100, 10);
-        submit_ok(&client, &submitter, &country, &category, 999, 10);
 
+        // Same key, different value: refused rather than silently ignored, so a
+        // caller cannot mistake "kept the first write" for "wrote mine".
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &999,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::DuplicateSubmission
+        );
+
+        // The original is intact and the index was not duplicated.
         let history = client.get_history(&country, &category);
         assert_eq!(history.len(), 1);
         assert_eq!(history.get(0).unwrap().value, 100);
+        assert_eq!(client.get(&country, &category, &10).unwrap().value, 100);
+    }
+
+    #[test]
+    fn a_duplicate_is_detected_per_key_component() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let ng = sym(&env, "NG");
+        let food = sym(&env, "Food");
+        let rent = sym(&env, "Rent");
+        let gh = sym(&env, "GH");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &ng, &food, 100, 10);
+
+        // Every component differs, so every one of these is a distinct record.
+        submit_ok(&client, &submitter, &ng, &food, 200, 11);
+        submit_ok(&client, &submitter, &ng, &rent, 300, 10);
+        submit_ok(&client, &submitter, &gh, &food, 400, 10);
+
+        assert_eq!(client.get_history(&ng, &food).len(), 2);
+        assert_eq!(client.get_history(&ng, &rent).len(), 1);
+        assert_eq!(client.get_history(&gh, &food).len(), 1);
+
+        // Only the exact triple collides.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &ng,
+                    &food,
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::DuplicateSubmission
+        );
+    }
+
+    #[test]
+    fn a_duplicate_is_detected_regardless_of_window_or_submitter() {
+        let env = make_env();
+        let client = deploy(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &alice, &country, &category, 100, 10);
+
+        // The key is the record's identity; neither the window nor the submitter
+        // is part of it, so neither can be varied to smuggle in a second value
+        // for the same observation instant.
+        for (submitter, window) in [(&alice, 1_u64), (&bob, DEFAULT_VALIDITY_WINDOW_SECS)] {
+            assert_eq!(
+                client
+                    .try_submit(&submitter, &country, &category, &777, &10_u64, &window)
+                    .unwrap_err()
+                    .unwrap(),
+                Error::DuplicateSubmission
+            );
+        }
+
+        assert_eq!(client.get(&country, &category, &10).unwrap().value, 100);
+        assert_eq!(client.get_history(&country, &category).len(), 1);
+    }
+
+    // -- submission window validation -------------------------------------
+
+    #[test]
+    fn window_bounds_are_one_definition_of_the_window() {
+        let env = make_env();
+        let client = deploy(&env);
+
+        // Zero window: refused, not treated as instantaneous.
+        assert_eq!(client.window_bounds(&1_000, &0), Err(Error::InvalidWindow));
+        // Overflow: refused, not wrapped or saturated.
+        assert_eq!(
+            client.window_bounds(&u64::MAX, &1),
+            Err(Error::InvalidWindow)
+        );
+        assert_eq!(
+            client.window_bounds(&u64::MAX, &u64::MAX),
+            Err(Error::InvalidWindow)
+        );
+        // A window that lands exactly on u64::MAX is representable.
+        assert_eq!(client.window_bounds(&0, &u64::MAX), Ok(u64::MAX));
+        assert_eq!(client.window_bounds(&1_000, &86_400), Ok(87_400));
+    }
+
+    #[test]
+    fn the_window_is_inclusive_at_the_start_and_exclusive_at_expiry() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        client
+            .submit(&submitter, &country, &category, &100, &1_000_u64, &500_u64)
+            .unwrap();
+        let valid_until = client.window_bounds(&1_000, &500).unwrap();
+        assert_eq!(valid_until, 1_500);
+
+        // Fresh at the lower bound.
+        assert!(client.is_fresh(&country, &category, &1_000, &1_000));
+        // Fresh one tick before expiry.
+        assert!(client.is_fresh(&country, &category, &1_000, &1_499));
+        // Stale exactly at expiry: the upper bound is exclusive.
+        assert!(!client.is_fresh(&country, &category, &1_000, &1_500));
+        // Not yet valid before the lower bound.
+        assert!(!client.is_fresh(&country, &category, &1_000, &999));
+    }
+
+    // -- freshness for aggregation ----------------------------------------
+
+    #[test]
+    fn fresh_history_drops_expiry_and_not_yet_valid_records() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Three records with 100s windows: [1_000, 1_100), [2_000, 2_100),
+        // [3_000, 3_100).
+        for (ts, value) in [(1_000_u64, 100_i128), (2_000, 200), (3_000, 300)] {
+            client
+                .submit(&submitter, &country, &category, &value, &ts, &100_u64)
+                .unwrap();
+        }
+
+        // Everything is stored, expired or not.
+        assert_eq!(client.get_history(&country, &category).len(), 3);
+
+        // At 1_050 only the first is fresh.
+        let fresh = client.get_fresh_history(&country, &category, &1_050);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh.get(0).unwrap().value, 100);
+
+        // At 2_050 the second has joined and the first has gone.
+        let fresh = client.get_fresh_history(&country, &category, &2_050);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh.get(0).unwrap().value, 200);
+
+        // At 1_100 exactly, the first is expired: the upper bound is exclusive.
+        let fresh = client.get_fresh_history(&country, &category, &1_100);
+        assert_eq!(fresh.len(), 0);
+        assert_eq!(client.get_history(&country, &category).len(), 3);
+
+        // An empty group is empty, never an error.
+        assert_eq!(
+            client
+                .get_fresh_history(&country, &sym(&env, "Rent"), &1_050)
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_missing_record_is_never_fresh() {
+        let env = make_env();
+        let client = deploy(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+
+        assert!(!client.is_fresh(&country, &category, &1_000, &1_000));
+        assert_eq!(
+            client.get_fresh_history(&country, &category, &1_000).len(),
+            0
+        );
+    }
+
+    // -- admin configuration ----------------------------------------------
+
+    #[test]
+    fn an_unconfigured_vault_has_no_admin_and_no_restrictions() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        assert_eq!(client.admin(), None);
+        assert_eq!(client.max_validity_window(), None);
+        // Absent entries mean "no restriction", so submitting still works.
+        assert!(client.is_category_enabled(&category));
+        assert!(client.is_submitter_allowed(&submitter));
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+    }
+
+    #[test]
+    fn the_admin_can_be_configured_once() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.configure_admin(&admin);
+        assert_eq!(client.admin(), Some(admin.clone()));
+
+        // Handing the authority to a new address is a deliberate act, not a
+        // side effect of a retried transaction.
+        assert_eq!(
+            client.try_configure_admin(&other).unwrap_err().unwrap(),
+            Error::AdminNotConfigured
+        );
+        assert_eq!(client.admin(), Some(admin.clone()));
+    }
+
+    #[test]
+    fn policy_setters_are_admin_only() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let category = sym(&env, "Food");
+        let subject = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.configure_admin(&admin);
+
+        assert_eq!(
+            client
+                .try_set_category_enabled(&stranger, &category, &false)
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_submitter_allowed(&stranger, &subject, &false)
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_max_validity_window(&stranger, &Some(100))
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+
+        // Nothing was written by the refused calls.
+        assert!(client.is_category_enabled(&category));
+        assert!(client.is_submitter_allowed(&subject));
+        assert_eq!(client.max_validity_window(), None);
+    }
+
+    #[test]
+    fn a_disabled_category_or_denied_submitter_is_refused_by_submit() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let ng = sym(&env, "NG");
+        let food = sym(&env, "Food");
+        let rent = sym(&env, "Rent");
+        env.mock_all_auths();
+
+        client.configure_admin(&admin);
+        client.set_category_enabled(&admin, &food, &false);
+        client.set_submitter_allowed(&admin, &alice, &false);
+
+        assert!(!client.is_category_enabled(&food));
+        assert!(client.is_category_enabled(&rent));
+        assert!(!client.is_submitter_allowed(&alice));
+        assert!(client.is_submitter_allowed(&bob));
+
+        assert_eq!(
+            client
+                .try_submit(
+                    &bob,
+                    &ng,
+                    &food,
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::CategoryDisabled
+        );
+        assert_eq!(
+            client
+                .try_submit(
+                    &alice,
+                    &ng,
+                    &rent,
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::SubmitterNotAllowed
+        );
+
+        // The unrestricted combination still works, so a policy entry does not
+        // disable more than it names.
+        client
+            .submit(
+                &bob,
+                &ng,
+                &rent,
+                &100,
+                &1_000_u64,
+                &DEFAULT_VALIDITY_WINDOW_SECS,
+            )
+            .unwrap();
+
+        // Re-enabling restores the category.
+        client.set_category_enabled(&admin, &food, &true);
+        client
+            .submit(
+                &bob,
+                &ng,
+                &food,
+                &100,
+                &1_000_u64,
+                &DEFAULT_VALIDITY_WINDOW_SECS,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_maximum_validity_window_bounds_what_submit_accepts() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        client.configure_admin(&admin);
+        client.set_max_validity_window(&admin, &Some(3_600));
+
+        assert_eq!(client.max_validity_window(), Some(3_600));
+
+        assert_eq!(
+            client
+                .try_submit(&submitter, &country, &category, &100, &1_000_u64, &3_601_u64)
+                .unwrap_err()
+                .unwrap(),
+            Error::WindowTooLong
+        );
+        // Exactly the bound is accepted.
+        client
+            .submit(&submitter, &country, &category, &100, &1_000_u64, &3_600_u64)
+            .unwrap();
+
+        // Removing the bound restores acceptance.
+        client.set_max_validity_window(&admin, &None);
+        assert_eq!(client.max_validity_window(), None);
+        client
+            .submit(&submitter, &country, &category, &200, &2_000_u64, &86_400_u64)
+            .unwrap();
+    }
+
+    #[test]
+    fn every_policy_change_publishes_an_event() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        let category = sym(&env, "Food");
+        let subject = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.configure_admin(&admin);
+
+        let before = env.events().all().events().len();
+
+        client.set_max_validity_window(&admin, &Some(3_600));
+        client.set_max_validity_window(&admin, &None);
+        client.set_category_enabled(&admin, &category, &false);
+        client.set_category_enabled(&admin, &category, &true);
+        client.set_submitter_allowed(&admin, &subject, &false);
+        client.set_submitter_allowed(&admin, &subject, &true);
+
+        // One event per change, including the "remove the bound" direction.
+        assert_eq!(env.events().all().events().len(), before + 6);
     }
 
     // â”€â”€ validity window â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
