@@ -1,5 +1,35 @@
 import { Pool } from "pg";
+import { ResponseCache } from "../cache/response-cache";
 import { PostgresDatabase } from "../db";
+
+describe("ResponseCache capacity", () => {
+  it("evicts fully expired entries before live entries when over capacity", async () => {
+    const cache = new ResponseCache({
+      ttlMs: 100,
+      staleWhileRevalidateMs: 0,
+      maxEntries: 2,
+      readEpoch: async () => 0,
+    });
+    const now = jest.spyOn(Date, "now");
+
+    try {
+      now.mockReturnValue(1_000);
+      await cache.get("live-oldest", async () => "live");
+
+      now.mockReturnValue(950);
+      await cache.get("expired-newer", async () => "expired");
+
+      now.mockReturnValue(1_055);
+      await cache.get("incoming", async () => "new");
+
+      expect(cache.stats().keys).toEqual(["live-oldest", "incoming"]);
+      expect(cache.stats().size).toBe(2);
+      expect(cache.stats().evictions).toBe(1);
+    } finally {
+      now.mockRestore();
+    }
+  });
+});
 
 describe("PostgresDatabase.insertPost", () => {
   const postRow = {

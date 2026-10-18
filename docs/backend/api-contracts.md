@@ -4,13 +4,11 @@ The read-only HTTP surface served by `createApp()` in `Backend/src/api/index.ts`
 Request and response shapes below were read from the route modules on `main`
 (verified at commit `2c42735c443e`).
 
-> **Response envelope caveat.** `Backend/src/api/response.ts` defines
-> `sendSuccess`/`sendPaginated`/`sendError` wrappers around a
-> `{ success, data, timestamp }` envelope, but most routes return bare JSON
-> resources (`res.json(profile)`, `res.json({ posts, total, … })`) and route-level
-> errors return `{ "error": string, "code": string }` without `success`/`timestamp`.
-> Only the 404 catch-all and the global error handler use the shared envelope.
-> Treat the per-endpoint shapes below as the contract.
+> **Response envelope caveat.** Successful routes return endpoint-specific JSON
+> resources, not a common success envelope. Errors use the common
+> `{ "error": string, "code": string }` shape. Internal exception messages and
+> arbitrary error details are never serialized to clients; diagnostic context is
+> available in server logs and the `X-Correlation-Id` response header.
 
 ## Versioning
 
@@ -199,9 +197,9 @@ token mismatch.
 
 ### Request correlation
 
-A middleware reads `X-Correlation-Id` (or generates one) and stores it on
-`req.correlationId`. It is included in the details of `DATABASE_UNAVAILABLE` and
-`INTERNAL_ERROR` responses and in the HTTP error log line.
+A middleware reads `X-Correlation-Id` (or generates one), stores it on
+`req.correlationId`, and echoes it in the `X-Correlation-Id` response header and
+HTTP error log line. It is not included in the error body.
 
 ### Rate limiting
 
@@ -244,17 +242,16 @@ post counts likes that the post can actually hold.
 
 ### Errors
 
-Route-level errors:
+All errors use the same exact body shape, including route validation failures,
+rate limits, the API 404 catch-all, and errors handled by the global middleware:
 
 ```json
 { "error": "Profile not found", "code": "NOT_FOUND" }
 ```
 
-Global handler / 404 catch-all (shared envelope):
-
-```json
-{ "success": false, "error": "…", "code": "…", "timestamp": "…", "details": { "correlationId": "…" } }
-```
+The body contains exactly `error` and `code`; status remains the HTTP status
+listed below. Internal exception messages and arbitrary `details` are not
+returned. Use `X-Correlation-Id` to match a response to server-side diagnostics.
 
 | Status | Code | Source |
 | --- | --- | --- |
@@ -265,9 +262,9 @@ Global handler / 404 catch-all (shared envelope):
 | 404 | `NOT_FOUND` | Route-level or 404 catch-all |
 | 422 | `INVALID_THRESHOLD` | Pool threshold validation |
 | 429 | `RATE_LIMIT_EXCEEDED` | Rate limiter |
-| 500 | `INTERNAL_ERROR` | Unhandled error (with `correlationId`) |
+| 500 | `INTERNAL_ERROR` | Unhandled error |
 | 500 | `SEARCH_UNAVAILABLE` | Search backend missing |
-| 503 | `DATABASE_UNAVAILABLE` | Database error detected (with `correlationId`) |
+| 503 | `DATABASE_UNAVAILABLE` | Database error detected |
 | 503 | `REQUEST_TIMEOUT` | Request exceeded `REQUEST_TIMEOUT_MS` |
 | 503 | `DEBUG_DISABLED` | `DEBUG_TOKEN` not set |
 

@@ -7,11 +7,8 @@ export interface ApiSuccess<T = unknown> {
 }
 
 export interface ApiError {
-  success: false;
   error: string;
   code: string;
-  timestamp: string;
-  details?: unknown;
 }
 
 export interface ApiPaginated<T = unknown> extends ApiSuccess<T> {
@@ -54,14 +51,11 @@ export function sendError(
   status: number,
   error: string,
   code: string,
-  details?: unknown
+  _details?: unknown
 ): void {
   const body: ApiError = {
-    success: false,
     error,
     code,
-    timestamp: new Date().toISOString(),
-    ...(details !== undefined ? { details } : {}),
   };
   res.status(status).json(body);
 }
