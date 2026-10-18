@@ -84,6 +84,71 @@ reading all of them in one transaction — so the cap turns that into a bounded,
 predictable cost and makes an over-large request fail loudly rather than being
 silently truncated.
 
+## SentinelPool initialization
+
+`SentinelPool` is only meaningful once it has been configured. Every
+state-changing entry point — `stake`, `withdraw`, `set_threshold`,
+`set_min_stake` and `slash` — opens by calling `require_initialized`, which
+returns `Error::NotInitialized` when `DataKey::Admin` is absent. `is_initialized`
+exposes the same fact as a view.
+
+Without that guard the read-path defaults (`min_stake -> 0`,
+`lock_period -> 0`) describe a real pool with **no minimum stake and no
+withdrawal lock**: anyone could stake nothing, and `withdraw` would behave as
+though no lock existed. The guard converts that accidental configuration into an
+explicit, stable error.
+
+`initialize` is all-or-nothing. Parameters are validated in a fixed order, each
+step a pure predicate over the arguments, and all of them run **before**
+`require_auth` and before the first write:
+
+| Parameter | Rule | Error |
+| --- | --- | --- |
+| `min_stake` | `> 0` | `InvalidStake` |
+| `lock_period` | `1 <= n <= MAX_LOCK_PERIOD` | `InvalidLockPeriod` |
+| `threshold` | `> 0` | `InvalidThreshold` |
+
+A refused call therefore leaves **no** partial configuration behind:
+`is_initialized` keeps reporting `false`, `min_stake` and `threshold` keep
+reporting `0`, and a later corrected call still succeeds. A second successful
+initialization is refused with `Unauthorized`.
+
+`MAX_LOCK_PERIOD` (1 000 000 ledgers) exists because the lock is measured in
+`ledger.sequence()`, a `u32`. A lock that could not elapse would freeze every
+sentinel's stake permanently, so the parameter is bounded at configuration time
+rather than trusted.
+
+## SentinelPool authorization
+
+`set_threshold`, `set_min_stake` and `slash` all resolve the admin the same way,
+through `require_admin`:
+
+```text
+stored Admin == caller  ->  authorized
+anything else           ->  Unauthorized
+```
+
+The stored value is **mandatory**. The previous lookup fell back to
+`unwrap_or_else(|| caller.clone())`, so on an unconfigured pool the comparison
+`admin != stored_admin` was always false and whichever address authorized the
+call became the admin by default. Requiring a stored admin removes that path;
+combined with the initialization guard, an unconfigured pool cannot be
+configured *or* governed by anyone.
+
+## SentinelPool checked arithmetic
+
+| Operation | Guard | Failure |
+| --- | --- | --- |
+| `stake` balance | `checked_add` | `InvalidStake` |
+| `withdraw` remainder | `checked_sub` | `InsufficientBalance` |
+| `slash` remainder | `checked_sub` | `InsufficientBalance` |
+
+All three run **before** the balance map is written, so an overflow or an
+excessive withdrawal leaves the sentinel's stake exactly as it was — no partial
+write, no event. `stake(&sentinel, &i128::MAX)` therefore succeeds once (the
+balance *is* `i128::MAX`) and is refused on replay, because the second call is
+the one that would overflow.
+
 ## Prerequisites
 
 - Rust **stable** (1.84+ recommended; the Soroban environment supports 1.82+)
