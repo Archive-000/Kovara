@@ -128,3 +128,86 @@ describe("Post Event Handlers", () => {
     });
   });
 });
+
+/**
+ * Replay safety for post creation (BE-02).
+ *
+ * A post's id is assigned by the contract and is unique, so `(id)` is the
+ * identity of "this post was created". N deliveries must converge on the state
+ * that one delivery produces � in particular a redelivery must not reset the
+ * engagement counters, which have been moving forward since the post was
+ * created.
+ */
+describe("handlePostCreated � replay safety (BE-02)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("resolves the insert conflict in the same statement as the insert", async () => {
+    // Atomicity is the point: a redelivery racing the original must not be able
+    // to insert a second row between the check and the write.
+    const { event, context } = createMockPostCreatedEvent(7n, "GTEST123");
+    mockQuery.mockResolvedValueOnce({ rowCount: 0 });
+
+    await handlePostCreated(mockPool, event, context);
+
+    const [sql] = mockQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("ON CONFLICT (id) DO NOTHING");
+    expect(sql).toContain("RETURNING id");
+  });
+
+  it("never writes counters on the conflict path", async () => {
+    const { event, context } = createMockPostCreatedEvent(7n, "GTEST123");
+    mockQuery.mockResolvedValueOnce({ rowCount: 0 });
+
+    await handlePostCreated(mockPool, event, context);
+
+    const [sql, values] = mockQuery.mock.calls[0] as [string, unknown[]];
+    // The statement carries the initial 0/0 counters, and DO NOTHING means the
+    // existing row — with whatever engagement it has accumulated — is untouched.
+    expect(values[3]).toBe(0);
+    expect(values[4]).toBe(0);
+    expect(sql).not.toContain("UPDATE");
+  });
+
+  it("treats a burst of identical deliveries as a single post", async () => {
+    const { event, context } = createMockPostCreatedEvent(11n, "GTEST123");
+
+    // First delivery inserts; every redelivery hits the conflict path.
+    mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+    for (let i = 0; i < 4; i += 1) {
+      mockQuery.mockResolvedValueOnce({ rowCount: 0 });
+    }
+
+    for (let i = 0; i < 5; i += 1) {
+      await handlePostCreated(mockPool, event, context);
+    }
+
+    expect(mockQuery).toHaveBeenCalledTimes(5);
+    // Same parameters every time: the event identity is the only thing that
+    // decides, and it never changes across deliveries.
+    const parameterSets = mockQuery.mock.calls.map((call) => JSON.stringify(call[1], bigintReplacer));
+    expect(new Set(parameterSets).size).toBe(1);
+  });
+
+  it("distinguishes a replay from a first delivery by the returned row count", async () => {
+    const { event, context } = createMockPostCreatedEvent(3n, "GTEST123");
+
+    mockQuery.mockResolvedValueOnce({ rowCount: 1 });
+    await expect(handlePostCreated(mockPool, event, context)).resolves.toBeUndefined();
+
+    mockQuery.mockResolvedValueOnce({ rowCount: 0 });
+    await expect(handlePostCreated(mockPool, event, context)).resolves.toBeUndefined();
+  });
+
+  it("propagates a database failure so the delivery is retried", async () => {
+    const { event, context } = createMockPostCreatedEvent(5n, "GTEST123");
+    mockQuery.mockRejectedValueOnce(new Error("connection reset"));
+
+    await expect(handlePostCreated(mockPool, event, context)).rejects.toThrow("connection reset");
+  });
+});
+
+function bigintReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}

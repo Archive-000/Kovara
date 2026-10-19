@@ -14,6 +14,7 @@ import {
   setConnectionState,
   getConnectionState,
   deleteConnectionState,
+  isSecureStorageAvailable,
 } from "../utils/secureStorage";
 import { useNetworkContext, type NetworkPreset, type StellarNetworkId } from "./NetworkContext";
 
@@ -348,6 +349,16 @@ export function WalletProvider({ children }: { children: ReactNode }): JSX.Eleme
 
       setState("disconnected");
       setWallet({ address: null, network: null, provider: null });
+
+      // FE-30: the reads above can fail on a locked keychain, a device with no
+      // secure enclave, or a web build where `expo-secure-store` is
+      // unsupported. That is "there is no stored session", not "the wallet is
+      // broken" — so the app starts disconnected and the user can reconnect,
+      // instead of sitting on an error screen offering a retry that can never
+      // work. The session lives on the server, so nothing is actually lost.
+      if (!isSecureStorageAvailable()) {
+        console.warn("secure storage unavailable; continuing without a restored session");
+      }
     } catch (err) {
       setState("error");
       setError(err instanceof Error ? err.message : "Unknown error");
