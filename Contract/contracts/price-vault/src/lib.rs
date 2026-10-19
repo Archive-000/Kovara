@@ -1,17 +1,17 @@
 #![no_std]
 
-//! `PriceVault` â€” stores raw price submissions keyed by `(country_iso,
+//! `PriceVault` — stores raw price submissions keyed by `(country_iso,
 //! category, valid_from)`.
 //!
 //! A submission is a single cost-of-living observation (bread, rent, transport,
-//! â€¦) made in a given country at a given moment. Each observation carries an
+//! …) made in a given country at a given moment. Each observation carries an
 //! explicit **validity window** and moves through a strict **verification
 //! state machine** before it can be aggregated into the Kovara index.
 //!
 //! ```text
-//!                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Verified   (terminal)
-//!  submit() â”€â”€â–º Pending â”€â”€â”¤
-//!                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–º Rejected   (terminal)
+//!                         ┌──────────────► Verified   (terminal)
+//!  submit() ──► Pending ──┤
+//!                         └──────────────► Rejected   (terminal)
 //! ```
 //!
 //! # Design invariants
@@ -21,9 +21,9 @@
 //! Every rejection path in [`PriceVault::submit`] is a **pure** predicate over
 //! the caller's arguments. The order is fixed:
 //!
-//! 1. [`registry`] â€” the country and category must be known identifiers.
-//! 2. [`payload`] â€” the arguments must satisfy [`SUBMIT_SCHEMA`].
-//! 3. [`guards`] â€” arithmetic is checked, never assumed.
+//! 1. [`registry`] — the country and category must be known identifiers.
+//! 2. [`payload`] — the arguments must satisfy [`SUBMIT_SCHEMA`].
+//! 3. [`guards`] — arithmetic is checked, never assumed.
 //!
 //! Only then does the contract call `require_auth` and touch storage. A
 //! malformed call therefore costs the caller nothing beyond the validation it
@@ -45,7 +45,7 @@
 //! ## Terminal states are terminal
 //!
 //! `Verified` and `Rejected` are absorbing. There is no path back to `Pending`
-//! and no path between them â€” see [`SubmissionStatus::can_transition_to`]. An
+//! and no path between them — see [`SubmissionStatus::can_transition_to`]. An
 //! attempt to leave a terminal state fails with [`Error::InvalidTransition`]
 //! and leaves the record byte-for-byte unchanged.
 //!
@@ -61,7 +61,7 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
-// â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Constants ────────────────────────────────────────────────────────────────
 
 /// Default validity window: 24 hours expressed in seconds.
 ///
@@ -78,20 +78,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The ceiling bounds how far one rogue submission can skew an index median.
 pub const MAX_PRICE: i128 = 1_000_000_000_000;
 
-/// Largest page [`PriceVault::get_submitter_history`] will return.
-///
-/// An unbounded history read is a denial-of-service vector: a submitter with
-/// thousands of records would force a caller to pay for reading all of them in
-/// one transaction. The cap turns that into a bounded, predictable cost, and
-/// [`Error::InvalidPageSize`] makes an over-large request fail loudly rather
-/// than being silently truncated.
-pub const MAX_HISTORY_PAGE_SIZE: u32 = 50;
-
-// â”€â”€ Errors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Errors returned by `PriceVault`.
 ///
-/// Discriminants are contiguous from 1 and append-only â€” see the ABI note in
+/// Discriminants are contiguous from 1 and append-only — see the ABI note in
 /// the module docs.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -112,7 +103,7 @@ pub enum Error {
     /// No submission exists for the given key.
     NotFound = 7,
 
-    // â”€â”€ payload schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── payload schema ───────────────────────────────────────────────────
     /// A required field is missing.
     MissingRequiredField = 8,
     /// A field value is below its declared minimum.
@@ -128,7 +119,7 @@ pub enum Error {
     /// The payload's schema version is not the one this build understands.
     SchemaMismatch = 14,
 
-    // â”€â”€ guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── guards ──────────────────────────────────────────────────────────
     /// A price value was zero.
     ZeroPrice = 15,
     /// A price value was negative.
@@ -142,6 +133,31 @@ pub enum Error {
     /// A multiplication would overflow the target type.
     ArithmeticOverflowMul = 20,
 
+    // ── access control ────────────────────────────────────────────────
+    /// The caller is not the contract admin.
+    Unauthorized = 21,
+    /// The country is not in the configured allowlist.
+    CountryNotAllowed = 22,
+    /// The category is not in the configured allowlist.
+    CategoryNotAllowed = 23,
+    /// The submitter may not write this category.
+    SubmitterNotAllowed = 24,
+    /// `initialize` was called more than once.
+    AlreadyInitialized = 25,
+}
+
+/// Which categories one submitter is allowed to write.
+///
+/// An **empty** `categories` list means "every category the registry accepts",
+/// which is what lets a deployment start open and be narrowed later without a
+/// storage migration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Authorization {
+    /// The submitter this policy applies to.
+    pub submitter: Address,
+    /// Categories this submitter may write; empty means all of them.
+    pub categories: Vec<Symbol>,
     // â”€â”€ bounded history queries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     /// A page size was zero or above [`MAX_HISTORY_PAGE_SIZE`].
     InvalidPageSize = 21,
@@ -163,15 +179,15 @@ pub enum Error {
     AdminNotConfigured = 27,
 }
 
-// â”€â”€ Identifier registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Identifier registry ──────────────────────────────────────────────────────
 
 /// The set of country and basket-category identifiers the protocol understands.
 ///
 /// The registry is deliberately **not** encoded in any storage key. Every stored
 /// record references an identifier by `Symbol`, and the identifier is checked
 /// against this registry at the contract boundary, so adding a country or a
-/// category later is a code change that leaves previously stored records â€” and
-/// their keys â€” untouched. Extending it therefore needs no storage migration
+/// category later is a code change that leaves previously stored records — and
+/// their keys — untouched. Extending it therefore needs no storage migration
 /// and cannot invalidate existing submissions.
 pub mod registry {
     use soroban_sdk::{Env, Symbol, Vec};
@@ -227,13 +243,13 @@ pub mod registry {
     }
 }
 
-// â”€â”€ Fail-safe arithmetic guards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Fail-safe arithmetic guards ──────────────────────────────────────────────
 
 /// Centralised arithmetic safety guards.
 ///
 /// Every guard is a pure function returning `Err` rather than panicking. A
 /// panic in a Soroban contract aborts the transaction without emitting an error
-/// code, burning caller fees and leaving no diagnosable trace â€” so overflow and
+/// code, burning caller fees and leaving no diagnosable trace — so overflow and
 /// bad input are always values, never faults.
 pub mod guards {
     use super::Error;
@@ -241,8 +257,8 @@ pub mod guards {
     /// Reject a price value that is zero or negative.
     ///
     /// # Errors
-    /// * [`Error::NegativePrice`] â€” `value < 0`
-    /// * [`Error::ZeroPrice`] â€” `value == 0`
+    /// * [`Error::NegativePrice`] — `value < 0`
+    /// * [`Error::ZeroPrice`] — `value == 0`
     #[inline]
     pub fn require_positive_price(value: i128) -> Result<(), Error> {
         if value < 0 {
@@ -257,7 +273,7 @@ pub mod guards {
     /// Reject a `u64` value that is zero.
     ///
     /// # Errors
-    /// * [`Error::ZeroValue`] â€” `value == 0`
+    /// * [`Error::ZeroValue`] — `value == 0`
     #[inline]
     pub fn require_positive_u64(value: u64) -> Result<(), Error> {
         if value == 0 {
@@ -269,7 +285,7 @@ pub mod guards {
     /// Reject an `i128` amount that is zero or negative.
     ///
     /// # Errors
-    /// * [`Error::NonPositiveAmount`] â€” `amount <= 0`
+    /// * [`Error::NonPositiveAmount`] — `amount <= 0`
     #[inline]
     pub fn require_positive_i128(amount: i128) -> Result<(), Error> {
         if amount <= 0 {
@@ -281,7 +297,7 @@ pub mod guards {
     /// Checked `u64` addition.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflow`] â€” the result would exceed `u64::MAX`.
+    /// * [`Error::ArithmeticOverflow`] — the result would exceed `u64::MAX`.
     #[inline]
     pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, Error> {
         a.checked_add(b).ok_or(Error::ArithmeticOverflow)
@@ -290,7 +306,7 @@ pub mod guards {
     /// Checked `i128` addition.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflow`] â€” the result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflow`] — the result would overflow `i128`.
     #[inline]
     pub fn checked_add_i128(a: i128, b: i128) -> Result<i128, Error> {
         a.checked_add(b).ok_or(Error::ArithmeticOverflow)
@@ -299,14 +315,14 @@ pub mod guards {
     /// Checked `i128` multiplication.
     ///
     /// # Errors
-    /// * [`Error::ArithmeticOverflowMul`] â€” the result would overflow `i128`.
+    /// * [`Error::ArithmeticOverflowMul`] — the result would overflow `i128`.
     #[inline]
     pub fn checked_mul_i128(a: i128, b: i128) -> Result<i128, Error> {
         a.checked_mul(b).ok_or(Error::ArithmeticOverflowMul)
     }
 }
 
-// â”€â”€ Payload schema validation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Payload schema validation ────────────────────────────────────────────────
 
 /// Schema validation for external payloads.
 ///
@@ -333,7 +349,7 @@ pub mod payload {
     /// A single named constraint applied to a payload field.
     ///
     /// Constraints are evaluated in declaration order and the first failure
-    /// returns immediately â€” there is no error accumulation, which is how
+    /// returns immediately — there is no error accumulation, which is how
     /// Soroban contracts communicate a single failure to a caller.
     #[derive(Copy, Clone, Debug)]
     pub enum Constraint {
@@ -435,13 +451,112 @@ pub const SUBMIT_SCHEMA: &[payload::Constraint] = &[
     payload::Constraint::SchemaVersion(SCHEMA_VERSION),
 ];
 
-// â”€â”€ Submission status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- Access control -----------------------------------------------------------
+
+/// Load the admin, or [`Error::NotFound`] when the contract is unconfigured.
+fn load_admin(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotFound)
+}
+
+/// Reject a caller that is not the configured admin.
+///
+/// Checking the stored address *before* `require_auth` means an unauthorised
+/// caller is refused on one cheap storage read instead of paying for an auth
+/// prompt it could never satisfy.
+fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    if *admin != load_admin(env)? {
+        return Err(Error::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+/// Whether `country` passes the configured country allowlist.
+///
+/// An empty allowlist imposes no restriction: the static [`registry`] has
+/// already vetted the identifier, and "empty means no extra restriction" is
+/// what lets a deployment start open and be narrowed in a later governance
+/// action without a migration.
+fn country_allowed(env: &Env, country: &Symbol) -> bool {
+    let list: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::CountryAllowlist)
+        .unwrap_or_else(|| Vec::new(env));
+    if list.is_empty() {
+        return true;
+    }
+    for entry in list.iter() {
+        if &entry == country {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `category` passes the configured category allowlist.
+///
+/// Empty means unrestricted; see [`country_allowed`].
+fn category_allowed(env: &Env, category: &Symbol) -> bool {
+    let list: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::CategoryAllowlist)
+        .unwrap_or_else(|| Vec::new(env));
+    if list.is_empty() {
+        return true;
+    }
+    for entry in list.iter() {
+        if &entry == category {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `submitter` may write `category` under the configured policy.
+///
+/// Empty policy means unrestricted. Otherwise the submitter needs an entry, and
+/// that entry's `categories` must be empty (all categories) or contain
+/// `category`. An entry that does not cover the category is a refusal, not a
+/// fall-through to the next entry — otherwise a submitter with a narrow grant
+/// could be widened by a later duplicate entry for the same address.
+fn submitter_allowed(env: &Env, submitter: &Address, category: &Symbol) -> bool {
+    let policy: Vec<Authorization> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Authorizations)
+        .unwrap_or_else(|| Vec::new(env));
+    if policy.is_empty() {
+        return true;
+    }
+    for i in 0..policy.len() {
+        let entry = policy.get(i).unwrap();
+        if &entry.submitter == submitter {
+            if entry.categories.is_empty() {
+                return true;
+            }
+            for j in 0..entry.categories.len() {
+                if &entry.categories.get(j).unwrap() == category {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
+
+// ── Submission status ────────────────────────────────────────────────────────
 
 /// Lifecycle state of a single price submission.
 ///
 /// ```text
-/// Pending â”€â”€â–º Verified   (terminal)
-///         â””â”€â–º Rejected   (terminal)
+/// Pending ──► Verified   (terminal)
+///         └─► Rejected   (terminal)
 /// ```
 ///
 /// Consumers matching on status should match exhaustively on all three
@@ -484,7 +599,7 @@ impl SubmissionStatus {
     }
 }
 
-// â”€â”€ Storage keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,12 +610,14 @@ pub enum DataKey {
     /// component and the start of the validity window.
     Price(Symbol, Symbol, u64),
 
-    /// `(country_iso, category)` â†’ `Vec<u64>` of observation timestamps, in
+    /// `(country_iso, category)` → `Vec<u64>` of observation timestamps, in
     /// insertion order.
     ///
     /// Lets history queries enumerate records without a full-storage scan.
     SubmissionIndex(Symbol, Symbol),
 
+    /// Admin allowed to manage the access-control configuration.
+    Admin,
     /// `submitter` â†’ `Vec<SubmitterEntry>` for that submitter's records, in
     /// insertion order.
     ///
@@ -524,37 +641,19 @@ pub enum DataKey {
     SubmitterPolicy(Address),
 }
 
-/// One of a submitter's records, addressed well enough to reload it.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubmitterEntry {
-    /// Country the observation belongs to.
-    pub country_iso: Symbol,
-    /// Basket category.
-    pub category: Symbol,
-    /// Observation timestamp (the `valid_from` component of the `Price` key).
-    pub timestamp: u64,
+    /// `Vec<Symbol>` of countries submissions may be written for. Empty means
+    /// "every country the registry accepts".
+    CountryAllowlist,
+
+    /// `Vec<Symbol>` of categories submissions may be written for. Empty means
+    /// "every category the registry accepts".
+    CategoryAllowlist,
+
+    /// `Vec<Authorization>` describing who may write which category.
+    Authorizations,
 }
 
-/// One bounded page of a submitter's history.
-///
-/// The cursor is an **offset into an append-only index**, which is what makes
-/// pagination stable: appending new records never shifts the position of an
-/// existing one, so a caller holding `next_cursor` can resume after a gap
-/// without having seen any record twice or skipped one.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HistoryPage {
-    /// The records in this page, in insertion order.
-    pub submissions: Vec<PriceSubmission>,
-    /// Cursor to pass to fetch the page after this one. Equal to the number of
-    /// index entries consumed so far.
-    pub next_cursor: u32,
-    /// Whether any entry remains after this page.
-    pub has_more: bool,
-}
-
-// â”€â”€ Domain types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Domain types ─────────────────────────────────────────────────────────────
 
 /// A single raw price submission with an attached validity window.
 ///
@@ -593,12 +692,12 @@ impl PriceSubmission {
     }
 }
 
-// â”€â”€ Events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Events ───────────────────────────────────────────────────────────────────
 
 /// Emitted after a price submission is recorded.
 ///
-/// `country_iso` and `category` are **topics** â€” the two dimensions an indexer
-/// filters on â€” so a consumer can subscribe to just the submissions it cares
+/// `country_iso` and `category` are **topics** — the two dimensions an indexer
+/// filters on — so a consumer can subscribe to just the submissions it cares
 /// about without decoding every body. The body carries the rest of the
 /// metadata so an indexer can build its record from the event alone.
 ///
@@ -608,10 +707,10 @@ impl PriceSubmission {
 #[contractevent]
 #[derive(Clone)]
 pub struct PriceSubmitted {
-    /// Topic â€” the country this observation belongs to.
+    /// Topic — the country this observation belongs to.
     #[topic]
     pub country_iso: Symbol,
-    /// Topic â€” the basket category.
+    /// Topic — the basket category.
     #[topic]
     pub category: Symbol,
     /// The submitting oracle/operator.
@@ -628,6 +727,7 @@ pub struct PriceSubmitted {
     pub schema_version: u32,
 }
 
+// ── Contract ─────────────────────────────────────────────────────────────────
 /// Emitted after a submission's status changes.
 ///
 /// # What an indexer needs
@@ -708,6 +808,7 @@ pub struct PriceVault;
 
 #[contractimpl]
 impl PriceVault {
+    // ── Mutating entry points ───────────────────────────────────────────
     // â”€â”€ Mutating entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// # Record a raw price submission
@@ -718,6 +819,7 @@ impl PriceVault {
     /// observations.
     ///
     /// Validation order is fixed and every step before auth is a pure
+    /// predicate — see the module docs. If a record already exists for the same
     /// predicate â€” see the module docs. If a record already exists for the same
     /// `(country_iso, category, valid_from)` triple the call is **refused** with
     /// [`Error::DuplicateSubmission`]: the key is occupied, the original is kept,
@@ -726,6 +828,14 @@ impl PriceVault {
     /// genuine first write.
     ///
     /// # Errors
+    /// * [`Error::InvalidCountry`] — country is not a registry identifier.
+    /// * [`Error::InvalidCategory`] — category is not a registry identifier.
+    /// * [`Error::ZeroNotAllowed`] — `valid_from` or `value` is zero.
+    /// * [`Error::NegativeNotAllowed`] — `value` is negative.
+    /// * [`Error::ValueAboveMaximum`] — `value` exceeds [`MAX_PRICE`].
+    /// * [`Error::EmptySymbol`] — country or category is empty.
+    /// * [`Error::SchemaMismatch`] — caller expects another schema version.
+    /// * [`Error::InvalidWindow`] — zero window, or `valid_from + window`
     /// * [`Error::InvalidCountry`] â€” country is not a registry identifier.
     /// * [`Error::InvalidCategory`] â€” category is not a registry identifier.
     /// * [`Error::ZeroNotAllowed`] â€” `valid_from` or `value` is zero.
@@ -748,6 +858,7 @@ impl PriceVault {
         valid_from: u64,
         validity_window_secs: u64,
     ) -> Result<(), Error> {
+        // 1. Identifier registry — pure, before auth and before storage.
         // 1. Identifier registry â€” pure, before auth and before storage.
         if !registry::is_supported_country(&env, &country_iso) {
             return Err(Error::InvalidCountry);
@@ -756,6 +867,20 @@ impl PriceVault {
             return Err(Error::InvalidCategory);
         }
 
+        // Configurable narrowing of the static registry. An empty allowlist or
+        // policy imposes no restriction, so a deployment that never calls
+        // initialize behaves exactly as before.
+        if !country_allowed(&env, &country_iso) {
+            return Err(Error::CountryNotAllowed);
+        }
+        if !category_allowed(&env, &category) {
+            return Err(Error::CategoryNotAllowed);
+        }
+        if !submitter_allowed(&env, &submitter, &category) {
+            return Err(Error::SubmitterNotAllowed);
+        }
+
+        // 2. Payload schema — pure, before auth and before storage.
         // 2. Payload schema â€” pure, before auth and before storage.
         payload::validate(
             SUBMIT_SCHEMA,
@@ -768,6 +893,7 @@ impl PriceVault {
             },
         )?;
 
+        // 3. Guards — defence in depth for the price itself.
         // 3. Guards â€” defence in depth for the price itself.
         guards::require_positive_price(value)?;
 
@@ -868,6 +994,8 @@ impl PriceVault {
     /// The record is left byte-for-byte unchanged when a transition is refused.
     ///
     /// # Errors
+    /// * [`Error::NotFound`] — no submission for the given key.
+    /// * [`Error::InvalidTransition`] — `new_status` is `Pending`, or the
     /// * [`Error::NotFound`] â€” no submission for the given key.
     /// * [`Error::InvalidTransition`] â€” `new_status` is `Pending`, or the
     ///   current status is already terminal.
@@ -913,6 +1041,11 @@ impl PriceVault {
         Ok(())
     }
 
+    // ── Read entry points ───────────────────────────────────────────────
+
+    /// Read a stored submission by its exact composite key.
+    ///
+    /// Returns the record regardless of whether it is currently fresh — use
     // â”€â”€ Read entry points â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// Read a stored submission by its exact composite key.
@@ -1072,6 +1205,7 @@ impl PriceVault {
     /// All submissions for `(country_iso, category)`, in insertion order.
     ///
     /// Deterministic: identical contract state always produces an identical
+    /// sequence. Returns an empty `Vec` when there are none — never panics.
     /// sequence. Returns an empty `Vec` when there are none â€” never panics.
     /// For bounded reads prefer [`Self::get_history_range`].
     pub fn get_history(
@@ -1093,6 +1227,7 @@ impl PriceVault {
     /// insertion order. Both bounds are inclusive.
     ///
     /// # Errors
+    /// * [`Error::InvalidRange`] — `from_ts > to_ts`.
     /// * [`Error::InvalidRange`] â€” `from_ts > to_ts`.
     pub fn get_history_range(
         env: Env,
@@ -1144,6 +1279,23 @@ impl PriceVault {
             .get(&DataKey::Price(country_iso, category, latest_ts))
     }
 
+    // -- Access control entry points -----------------------------------------
+
+    /// # Configure the access-control admin
+    ///
+    /// Idempotent-by-refusal: the first caller wins and every later call
+    /// returns [`Error::AlreadyInitialized`]. Without this a freshly deployed
+    /// contract would have no owner and nobody could ever narrow the
+    /// allowlists.
+    ///
+    /// A submission already accepts every registry identifier, so an
+    /// unconfigured contract is open rather than broken.
+    ///
+    /// # Errors
+    /// * [`Error::AlreadyInitialized`] — an admin is already set.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
     /// # One bounded page of a submitter's records
     ///
     /// Returns at most [`MAX_HISTORY_PAGE_SIZE`] records starting at `cursor`
@@ -1439,12 +1591,18 @@ impl PriceVault {
                 result.push_back(submission);
             }
         }
-        result
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        Ok(())
     }
 }
 
 // â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    /// The configured admin, or `None` when the contract is unconfigured.
+    pub fn admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1453,19 +1611,228 @@ mod tests {
         Env,
     };
 
-    fn make_env() -> Env {
-        Env::default()
+    /// Hand the admin role to a new address.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the current admin.
+    pub fn set_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        Ok(())
     }
 
-    fn deploy(env: &Env) -> PriceVaultClient {
-        let contract_id = env.register(PriceVault, ());
-        PriceVaultClient::new(env, &contract_id)
+    /// # Restrict which countries may receive submissions
+    ///
+    /// Narrows the static [`registry`]; it cannot widen it, because every
+    /// entry is validated against the registry first. An empty list clears the
+    /// restriction and returns the contract to registry-only behaviour.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCountry`] — an entry is not a registry identifier.
+    pub fn set_country_allowlist(
+        env: Env,
+        admin: Address,
+        countries: Vec<Symbol>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..countries.len() {
+            if !registry::is_supported_country(&env, &countries.get(i).unwrap()) {
+                return Err(Error::InvalidCountry);
+            }
+        }
+        env.storage().instance().set(&DataKey::CountryAllowlist, &countries);
+        Ok(())
     }
 
-    fn sym(env: &Env, s: &str) -> Symbol {
-        Symbol::new(env, s)
+    /// The configured country allowlist. Empty means unrestricted.
+    pub fn get_country_allowlist(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CountryAllowlist)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// # Restrict which categories may receive submissions
+    ///
+    /// As with the country allowlist, an empty list clears the restriction.
+    /// Enforced in `submit` before `require_auth` and before any storage
+    /// access, so an unknown category costs the caller a single read.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCategory`] — an entry is not a registry identifier.
+    pub fn set_category_allowlist(
+        env: Env,
+        admin: Address,
+        categories: Vec<Symbol>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..categories.len() {
+            if !registry::is_supported_category(&env, &categories.get(i).unwrap()) {
+                return Err(Error::InvalidCategory);
+            }
+        }
+        env.storage().instance().set(&DataKey::CategoryAllowlist, &categories);
+        Ok(())
+    }
+
+    /// The configured category allowlist. Empty means unrestricted.
+    pub fn get_category_allowlist(env: Env) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CategoryAllowlist)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// # Restrict which submitters may write which categories
+    ///
+    /// Replaces the whole policy. An empty policy imposes no restriction; an
+    /// entry with an empty `categories` grants every category. Every category
+    /// named in the policy is validated against the registry, so the policy
+    /// cannot grant a category that would be rejected anyway.
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] — caller is not the admin.
+    /// * [`Error::InvalidCategory`] — a named category is not a registry
+    ///   identifier.
+    pub fn set_authorizations(
+        env: Env,
+        admin: Address,
+        policy: Vec<Authorization>,
+    ) -> Result<(), Error> {
+        require_admin(&env, &admin)?;
+        for i in 0..policy.len() {
+            let entry = policy.get(i).unwrap();
+            for j in 0..entry.categories.len() {
+                if !registry::is_supported_category(&env, &entry.categories.get(j).unwrap()) {
+                    return Err(Error::InvalidCategory);
+                }
+            }
+        }
+        env.storage().instance().set(&DataKey::Authorizations, &policy);
+        Ok(())
+    }
+
+    /// The configured submitter policy. Empty means unrestricted.
+    pub fn get_authorizations(env: Env) -> Vec<Authorization> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Authorizations)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Whether `submitter` may currently write `category`.
+    ///
+    /// Exposed so a client can check before building a transaction, rather
+    /// than discovering the refusal by submitting.
+    pub fn is_submitter_authorized(env: Env, submitter: Address, category: Symbol) -> bool {
+        submitter_allowed(&env, &submitter, &category)
+    }
+
+    /// Whether `country` currently passes the allowlist.
+    pub fn is_country_allowed(env: Env, country: Symbol) -> bool {
+        country_allowed(&env, &country)
+    }
+
+    /// Whether `category` currently passes the allowlist.
+    pub fn is_category_allowed(env: Env, category: Symbol) -> bool {
+        category_allowed(&env, &category)
+    }
+
+    // ── Registry views ──────────────────────────────────────────────────
+
+    /// Whether `from -> to` is a permitted status transition.
+    ///
+    /// Publishes the transition table that `set_status` enforces, so a sentinel
+    /// daemon can ask "would this transition be accepted?" without submitting a
+    /// transaction that is going to be rejected. The answer is derived from the
+    /// same [`SubmissionStatus::can_transition_to`] the mutator uses, so the
+    /// view can never disagree with the enforcement.
+    ///
+    /// Returns `false` — never an error — for an unknown or terminal pair, so a
+    /// caller can use it as a plain boolean gate.
+    pub fn can_transition(from: SubmissionStatus, to: SubmissionStatus) -> bool {
+        from.can_transition_to(to)
+    }
+
+    /// The supported ISO 3166-1 alpha-2 country codes.
+    pub fn supported_countries(env: Env) -> Vec<Symbol> {
+        registry::countries(&env)
+    }
+
+    /// The supported cost-of-living basket categories.
+    pub fn supported_categories(env: Env) -> Vec<Symbol> {
+        registry::categories(&env)
+    }
+
+    /// The registry version this build was compiled against.
+    pub fn registry_version(_env: Env) -> u32 {
+        registry::VERSION
+    }
+
+    // ── Pure helpers, callable off-chain ────────────────────────────────
+
+    /// Add two `i128` values, failing safely on overflow.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflow`] — result would overflow `i128`.
+    pub fn safe_add(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
+        guards::checked_add_i128(a, b)
+    }
+
+    /// Multiply two `i128` values, failing safely on overflow.
+    ///
+    /// # Errors
+    /// * [`Error::ArithmeticOverflowMul`] — result would overflow `i128`.
+    pub fn safe_mul(_env: Env, a: i128, b: i128) -> Result<i128, Error> {
+        guards::checked_mul_i128(a, b)
+    }
+
+    /// Validate a submit payload without committing any state.
+    ///
+    /// Lets SDK clients and cross-contract callers confirm a payload is
+    /// structurally sound before building or forwarding a transaction.
+    pub fn validate_submit_payload(
+        _env: Env,
+        country_iso: Symbol,
+        category: Symbol,
+        value: i128,
+        timestamp: u64,
+    ) -> Result<(), Error> {
+        payload::validate(
+            SUBMIT_SCHEMA,
+            &payload::SubmitPayload {
+                country_iso: &country_iso,
+                category: &category,
+                value,
+                timestamp,
+                schema_version: SCHEMA_VERSION,
+            },
+        )
+    }
+
+    // ── Internal ────────────────────────────────────────────────────────
+
+    /// Load records for each timestamp in `timestamps`, skipping any that are
+    /// absent (defensive — under normal operation every indexed timestamp has
+    /// a record).
+    fn collect_submissions(
+        env: &Env,
+        country_iso: &Symbol,
+        category: &Symbol,
+        timestamps: &Vec<u64>,
+    ) -> Vec<PriceSubmission> {
+        let mut result = Vec::new(env);
+        for ts in timestamps.iter() {
+            let key = DataKey::Price(country_iso.clone(), category.clone(), ts);
+            if let Some(submission) = env.storage().persistent().get::<DataKey, PriceSubmission>(&key)
+            {
+                result.push_back(submission);
+            }
+        }
+        result
     /// Submit with the default validity window.
     fn submit_ok(
         client: &PriceVaultClient,
@@ -2227,7 +2594,70 @@ mod tests {
         // Before the window.
         assert!(!client.is_valid_at(&country, &category, &1_000, &999));
     }
+}
 
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    fn make_env() -> Env {
+        Env::default()
+    }
+
+    fn deploy(env: &Env) -> PriceVaultClient {
+        let contract_id = env.register(PriceVault, ());
+        PriceVaultClient::new(env, &contract_id)
+    }
+
+    fn sym(env: &Env, s: &str) -> Symbol {
+        Symbol::new(env, s)
+    }
+
+    /// Submit with the default validity window.
+    fn submit_ok(
+        client: &PriceVaultClient,
+        submitter: &Address,
+        country: &Symbol,
+        category: &Symbol,
+        value: i128,
+        valid_from: u64,
+    ) {
+        client
+            .submit(
+                submitter,
+                country,
+                category,
+                &value,
+                &valid_from,
+                &DEFAULT_VALIDITY_WINDOW_SECS,
+            )
+            .unwrap();
+    }
+
+    // ── guards ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn guard_price_bounds() {
+        assert_eq!(guards::require_positive_price(0), Err(Error::ZeroPrice));
+        assert_eq!(
+            guards::require_positive_price(-1),
+            Err(Error::NegativePrice)
+        );
+        assert_eq!(
+            guards::require_positive_price(i128::MIN),
+            Err(Error::NegativePrice)
+        );
+        assert!(guards::require_positive_price(1).is_ok());
+        assert!(guards::require_positive_price(i128::MAX).is_ok());
+    }
+
+    #[test]
+    fn guard_u64_and_i128_bounds() {
+        assert_eq!(guards::require_positive_u64(0), Err(Error::ZeroValue));
+        assert!(guards::require_positive_u64(1).is_ok());
     #[test]
     fn consecutive_windows_do_not_overlap() {
         let env = make_env();
@@ -2470,6 +2900,664 @@ mod tests {
         submit_ok(&client, &submitter, &country, &category, 200, 20);
         submit_ok(&client, &submitter, &country, &category, 300, 30);
 
+        assert_eq!(
+            guards::require_positive_i128(0),
+            Err(Error::NonPositiveAmount)
+        );
+        assert_eq!(
+            guards::require_positive_i128(-1),
+            Err(Error::NonPositiveAmount)
+        );
+        assert!(guards::require_positive_i128(1).is_ok());
+    }
+
+    #[test]
+    fn guard_checked_arithmetic() {
+        assert_eq!(guards::checked_add_u64(100, 200), Ok(300));
+        assert_eq!(guards::checked_add_u64(u64::MAX, 0), Ok(u64::MAX));
+        assert_eq!(
+            guards::checked_add_u64(u64::MAX, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        assert_eq!(guards::checked_add_i128(50, 50), Ok(100));
+        assert_eq!(
+            guards::checked_add_i128(i128::MAX, 1),
+            Err(Error::ArithmeticOverflow)
+        );
+        assert_eq!(
+            guards::checked_add_i128(i128::MIN, -1),
+            Err(Error::ArithmeticOverflow)
+        );
+
+        assert_eq!(guards::checked_mul_i128(3, 4), Ok(12));
+        assert_eq!(
+            guards::checked_mul_i128(i128::MAX, 2),
+            Err(Error::ArithmeticOverflowMul)
+        );
+        assert_eq!(
+            guards::checked_mul_i128(i128::MIN, -1),
+            Err(Error::ArithmeticOverflowMul)
+        );
+    }
+
+    // ── payload validate ────────────────────────────────────────────────
+
+    fn payload<'a>(
+        country: &'a Symbol,
+        category: &'a Symbol,
+        value: i128,
+        timestamp: u64,
+    ) -> payload::SubmitPayload<'a> {
+        payload::SubmitPayload {
+            country_iso: country,
+            category,
+            value,
+            timestamp,
+            schema_version: SCHEMA_VERSION,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        let env = make_env();
+        let ng = sym(&env, "NG");
+        let food = sym(&env, "Food");
+        let empty = sym(&env, "");
+
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 0, 1)),
+            Err(Error::ZeroNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, -1, 1)),
+            Err(Error::NegativeNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 100, 0)),
+            Err(Error::ZeroNotAllowed)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, MAX_PRICE + 1, 1)),
+            Err(Error::ValueAboveMaximum)
+        );
+        assert_eq!(
+            payload::validate(SUBMIT_SCHEMA, &payload(&empty, &food, 100, 1)),
+            Err(Error::EmptySymbol)
+        );
+        assert!(payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, 100, 1)).is_ok());
+        assert!(payload::validate(SUBMIT_SCHEMA, &payload(&ng, &food, MAX_PRICE, 1)).is_ok());
+    }
+
+    // ── registry ────────────────────────────────────────────────────────
+
+    #[test]
+    fn registry_recognises_known_identifiers() {
+        let env = make_env();
+        assert!(registry::is_supported_country(&env, &sym(&env, "NG")));
+        assert!(registry::is_supported_country(&env, &sym(&env, "US")));
+        assert!(!registry::is_supported_country(&env, &sym(&env, "ZZ")));
+        assert!(registry::is_supported_category(&env, &sym(&env, "Food")));
+        assert!(!registry::is_supported_category(&env, &sym(&env, "Weapons")));
+        assert_eq!(registry::countries(&env).len(), registry::COUNTRY_CODES.len());
+        assert_eq!(registry::categories(&env).len(), registry::CATEGORIES.len());
+    fn history_is_scoped_per_country_and_category() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        submit_ok(&client, &submitter, &sym(&env, "KE"), &sym(&env, "Food"), 200, 20);
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Rent"), 300, 30);
+
+        let ng_food = client.get_history(&sym(&env, "NG"), &sym(&env, "Food"));
+        assert_eq!(ng_food.len(), 1);
+        assert_eq!(ng_food.get(0).unwrap().value, 100);
+
+        let ke_food = client.get_history(&sym(&env, "KE"), &sym(&env, "Food"));
+        assert_eq!(ke_food.len(), 1);
+        assert_eq!(ke_food.get(0).unwrap().value, 200);
+
+        let ng_rent = client.get_history(&sym(&env, "NG"), &sym(&env, "Rent"));
+        assert_eq!(ng_rent.len(), 1);
+        assert_eq!(ng_rent.get(0).unwrap().value, 300);
+    }
+
+    #[test]
+    fn history_carries_full_audit_metadata() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 450, 50);
+
+        let record = client.get_history(&country, &category).get(0).unwrap();
+        assert_eq!(record.submitter, submitter);
+        assert_eq!(record.country_iso, country);
+        assert_eq!(record.category, category);
+        assert_eq!(record.value, 450);
+        assert_eq!(record.timestamp, 50);
+        assert_eq!(record.valid_from, 50);
+        assert_eq!(record.valid_until, 50 + DEFAULT_VALIDITY_WINDOW_SECS);
+        assert_eq!(record.status, SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn history_range_filters_inclusively() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        for ts in [10_u64, 20, 30, 40, 50] {
+            submit_ok(&client, &submitter, &country, &category, ts as i128 * 10, ts);
+        }
+
+        let range = client.get_history_range(&country, &category, &20, &40).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range.get(0).unwrap().timestamp, 20);
+        assert_eq!(range.get(1).unwrap().timestamp, 30);
+        assert_eq!(range.get(2).unwrap().timestamp, 40);
+
+        // Both bounds inclusive.
+        let single = client.get_history_range(&country, &category, &10, &10).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single.get(0).unwrap().timestamp, 10);
+
+        // A window with nothing in it.
+        let empty = client.get_history_range(&country, &category, &60, &70).unwrap();
+        assert_eq!(empty.len(), 0);
+    }
+
+    // ── submit ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn submit_stores_window_bounds_and_pending_status() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+
+        env.mock_all_auths();
+        submit_ok(&client, &submitter, &country, &category, 1_000, 1_000);
+
+        let s = client.get(&country, &category, &1_000).unwrap();
+        assert_eq!(s.valid_from, 1_000);
+        assert_eq!(s.valid_until, 1_000 + DEFAULT_VALIDITY_WINDOW_SECS);
+        assert_eq!(s.timestamp, 1_000);
+        assert_eq!(s.value, 1_000);
+        assert_eq!(s.submitter, submitter);
+        assert_eq!(s.status, SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn submit_rejects_unknown_identifiers() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "ZZ"),
+                    &sym(&env, "Food"),
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCountry
+        );
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Weapons"),
+                    &100,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+    }
+
+    #[test]
+    fn submit_rejects_bad_values_before_auth() {
+    fn history_range_rejects_an_inverted_range() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert_eq!(
+            client
+                .try_get_history_range(&sym(&env, "NG"), &sym(&env, "Food"), &100, &50)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidRange
+        );
+    }
+
+    #[test]
+    fn latest_is_the_most_recently_inserted_record() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Inserted out of timestamp order; the index is insertion-ordered, so
+        // "latest" is the last inserted, not the highest timestamp.
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 200, 30);
+        submit_ok(&client, &submitter, &country, &category, 150, 20);
+
+        let latest = client.get_latest(&country, &category).unwrap();
+        assert_eq!(latest.timestamp, 20);
+        assert_eq!(latest.value, 150);
+    }
+
+    #[test]
+    fn history_is_deterministic_for_the_same_state() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Zero price.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &0,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ZeroNotAllowed
+        );
+        // Negative price.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &-1,
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::NegativeNotAllowed
+        );
+        // Zero timestamp.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &100,
+                    &0_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ZeroNotAllowed
+        );
+        // Above the schema ceiling.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &country,
+                    &category,
+                    &(MAX_PRICE + 1),
+                    &1_000_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::ValueAboveMaximum
+        );
+    }
+
+    #[test]
+    fn submit_rejects_bad_windows() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Zero window.
+        assert_eq!(
+            client
+                .try_submit(&submitter, &country, &category, &100, &1_000_u64, &0_u64)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidWindow
+        );
+        // valid_from + window overflows u64.
+        assert_eq!(
+            client
+                .try_submit(&submitter, &country, &category, &100, &u64::MAX, &1_u64)
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidWindow
+        );
+    }
+
+    #[test]
+    fn resubmitting_the_same_key_is_a_no_op() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 999, 10);
+
+        let history = client.get_history(&country, &category);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().value, 100);
+    }
+
+    // ── validity window ─────────────────────────────────────────────────
+
+    #[test]
+    fn validity_window_bounds_are_half_open() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 100, 1_000);
+
+        // Lower bound inclusive.
+        assert!(client.is_valid_at(&country, &category, &1_000, &1_000));
+        // Interior.
+        assert!(client.is_valid_at(
+            &country,
+            &category,
+            &1_000,
+            &1_000 + DEFAULT_VALIDITY_WINDOW_SECS - 1
+        ));
+        // Upper bound exclusive.
+        assert!(!client.is_valid_at(
+            &country,
+            &category,
+            &1_000,
+            &1_000 + DEFAULT_VALIDITY_WINDOW_SECS
+        ));
+        // Before the window.
+        assert!(!client.is_valid_at(&country, &category, &1_000, &999));
+    }
+
+    #[test]
+    fn consecutive_windows_do_not_overlap() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        // Window 1 = [1_000, 2_000), window 2 = [2_000, 3_000).
+        client
+            .submit(&submitter, &country, &category, &100, &1_000_u64, &1_000_u64)
+            .unwrap();
+        client
+            .submit(&submitter, &country, &category, &200, &2_000_u64, &1_000_u64)
+            .unwrap();
+
+        // At 2_000 only window 2 is fresh.
+        assert!(!client.is_valid_at(&country, &category, &1_000, &2_000));
+        assert!(client.is_valid_at(&country, &category, &2_000, &2_000));
+    }
+
+    #[test]
+    fn get_valid_gates_on_freshness() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "KE");
+        let category = sym(&env, "Rent");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 500, 2_000);
+
+        assert!(client
+            .get_valid(&country, &category, &2_000, &2_000)
+            .is_some());
+        assert!(client
+            .get_valid(&country, &category, &2_000, &1_999)
+            .is_none());
+        assert!(client
+            .get_valid(&country, &category, &2_000, &100_000)
+            .is_none());
+        // Missing record.
+        assert!(client.get_valid(&country, &category, &9_999, &1).is_none());
+    }
+
+    #[test]
+    fn is_valid_at_is_false_for_missing_records() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert!(!client.is_valid_at(&sym(&env, "NG"), &sym(&env, "Food"), &1, &1));
+    }
+
+    // ── status machine ──────────────────────────────────────────────────
+
+    #[test]
+    fn transition_table_allows_only_pending_to_a_terminal_state() {
+        // Pending may reach either terminal state.
+        assert!(SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Verified));
+        assert!(SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Rejected));
+        // Pending is never a target.
+        assert!(!SubmissionStatus::Pending.can_transition_to(SubmissionStatus::Pending));
+        // Terminal states are absorbing.
+        assert!(!SubmissionStatus::Verified.can_transition_to(SubmissionStatus::Rejected));
+        assert!(!SubmissionStatus::Verified.can_transition_to(SubmissionStatus::Pending));
+        assert!(!SubmissionStatus::Rejected.can_transition_to(SubmissionStatus::Verified));
+        assert!(!SubmissionStatus::Rejected.can_transition_to(SubmissionStatus::Pending));
+
+        assert!(!SubmissionStatus::Pending.is_terminal());
+        assert!(SubmissionStatus::Verified.is_terminal());
+        assert!(SubmissionStatus::Rejected.is_terminal());
+    }
+
+    #[test]
+    fn status_discriminants_are_stable() {
+        // Pinned so external consumers can match on the u32 representation.
+        assert_eq!(SubmissionStatus::Pending as u32, 0);
+        assert_eq!(SubmissionStatus::Verified as u32, 1);
+        assert_eq!(SubmissionStatus::Rejected as u32, 2);
+    }
+
+    #[test]
+    fn pending_transitions_to_verified_and_rejected() {
+        for target in [SubmissionStatus::Verified, SubmissionStatus::Rejected] {
+            let env = make_env();
+            let client = deploy(&env);
+            let submitter = Address::generate(&env);
+            let verifier = Address::generate(&env);
+            let country = sym(&env, "NG");
+            let category = sym(&env, "Food");
+            env.mock_all_auths();
+
+            submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+            client
+                .set_status(&verifier, &country, &category, &100, &target)
+                .unwrap();
+            assert_eq!(client.get_status(&country, &category, &100), Some(target));
+        }
+    }
+
+    #[test]
+    fn terminal_states_reject_further_transitions() {
+        for terminal in [SubmissionStatus::Verified, SubmissionStatus::Rejected] {
+            for next in [
+                SubmissionStatus::Verified,
+                SubmissionStatus::Rejected,
+                SubmissionStatus::Pending,
+            ] {
+                let env = make_env();
+                let client = deploy(&env);
+                let submitter = Address::generate(&env);
+                let verifier = Address::generate(&env);
+                let country = sym(&env, "NG");
+                let category = sym(&env, "Food");
+                env.mock_all_auths();
+
+                submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+                client
+                    .set_status(&verifier, &country, &category, &100, &terminal)
+                    .unwrap();
+
+                assert_eq!(
+                    client
+                        .try_set_status(&verifier, &country, &category, &100, &next)
+                        .unwrap_err()
+                        .unwrap(),
+                    Error::InvalidTransition,
+                    "{terminal:?} -> {next:?} must be refused"
+                );
+                // The record is unchanged.
+                assert_eq!(
+                    client.get_status(&country, &category, &100),
+                    Some(terminal)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_is_not_a_valid_target() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+        assert_eq!(
+            client
+                .try_set_status(
+                    &verifier,
+                    &country,
+                    &category,
+                    &100,
+                    &SubmissionStatus::Pending,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidTransition
+        );
+    }
+
+    #[test]
+    fn set_status_on_missing_record_is_not_found() {
+        let env = make_env();
+        let client = deploy(&env);
+        let verifier = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_set_status(
+                    &verifier,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Food"),
+                    &999,
+                    &SubmissionStatus::Verified,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::NotFound
+        );
+    }
+
+    #[test]
+    fn status_round_trips_inside_the_record() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "IN");
+        let category = sym(&env, "Health");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 300, 75);
+        assert_eq!(
+            client.get(&country, &category, &75).unwrap().status,
+            SubmissionStatus::Pending
+        );
+
+        client
+            .set_status(
+                &verifier,
+                &country,
+                &category,
+                &75,
+                &SubmissionStatus::Rejected,
+            )
+            .unwrap();
+
+        let after = client.get(&country, &category, &75).unwrap();
+        assert_eq!(after.status, SubmissionStatus::Rejected);
+        // Other fields are untouched by a status change.
+        assert_eq!(after.value, 300);
+        assert_eq!(after.submitter, submitter);
+    }
+
+    // ── history ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn history_is_empty_when_there_are_no_submissions() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert_eq!(client.get_history(&sym(&env, "NG"), &sym(&env, "Food")).len(), 0);
+        assert!(client.get_latest(&sym(&env, "NG"), &sym(&env, "Food")).is_none());
+    }
+
+    #[test]
+    fn history_returns_submissions_in_insertion_order() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 100, 10);
+        submit_ok(&client, &submitter, &country, &category, 200, 20);
+        submit_ok(&client, &submitter, &country, &category, 300, 30);
+
         let history = client.get_history(&country, &category);
         assert_eq!(history.len(), 3);
         assert_eq!(history.get(0).unwrap().timestamp, 10);
@@ -2594,6 +3682,408 @@ mod tests {
         let category = sym(&env, "Food");
         env.mock_all_auths();
 
+        submit_ok(&client, &submitter, &country, &category, 1, 1);
+        submit_ok(&client, &submitter, &country, &category, 2, 2);
+
+        let first = client.get_history(&country, &category);
+        let second = client.get_history(&country, &category);
+        assert_eq!(first.len(), second.len());
+        for i in 0..first.len() {
+            assert_eq!(
+                first.get(i).unwrap().timestamp,
+                second.get(i).unwrap().timestamp
+            );
+        }
+    }
+
+    // ── pure helpers ────────────────────────────────────────────────────
+
+    // -- Access control (CT-53, CT-54, CT-55) ---------------------------
+
+    /// Deploy with an admin configured.
+    fn deploy_with_admin(env: &Env) -> (PriceVaultClient, Address, Address) {
+        let client = deploy(env);
+        let admin = Address::generate(env);
+        let submitter = Address::generate(env);
+        client.initialize(&admin);
+        (client, admin, submitter)
+    }
+
+    #[test]
+    fn initialize_is_once_only_and_records_the_admin() {
+        let env = make_env();
+        let client = deploy(&env);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(client.admin(), None);
+        client.initialize(&admin);
+        assert_eq!(client.admin(), Some(admin.clone()));
+        assert_eq!(
+            client.try_initialize(&admin).unwrap_err().unwrap(),
+            Error::AlreadyInitialized
+        );
+    }
+
+    #[test]
+    fn admin_can_be_handed_over() {
+        let env = make_env();
+        let (client, admin, _submitter) = deploy_with_admin(&env);
+        let successor = Address::generate(&env);
+        env.mock_all_auths();
+
+        client.set_admin(&admin, &successor);
+        assert_eq!(client.admin(), Some(successor));
+    }
+
+    #[test]
+    fn a_non_admin_cannot_change_configuration() {
+        let env = make_env();
+        let (client, _admin, _submitter) = deploy_with_admin(&env);
+        let interloper = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(
+            client
+                .try_set_country_allowlist(&interloper, &vec![&env, sym(&env, "NG")])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_category_allowlist(&interloper, &vec![&env, sym(&env, "Food")])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+        assert_eq!(
+            client
+                .try_set_authorizations(&interloper, &vec![&env])
+                .unwrap_err()
+                .unwrap(),
+            Error::Unauthorized
+        );
+    }
+
+    #[test]
+    fn allowlists_cannot_widen_the_registry() {
+        let env = make_env();
+        let (client, admin, _submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        // "ZZ" is not a registry country and "Weapons" is not a registry
+        // category, so neither can be allowlisted even though the allowlist is
+        // nominally the wider set.
+        assert_eq!(
+            client
+                .try_set_country_allowlist(&admin, &vec![&env, sym(&env, "ZZ")])
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCountry
+        );
+        assert_eq!(
+            client
+                .try_set_category_allowlist(&admin, &vec![&env, sym(&env, "Weapons")])
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+        assert_eq!(
+            client
+                .try_set_authorizations(
+                    &admin,
+                    &vec![
+                        &env,
+                        Authorization {
+                            submitter: Address::generate(&env),
+                            categories: vec![&env, sym(&env, "Weapons")],
+                        },
+                    ],
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::InvalidCategory
+        );
+    }
+
+    #[test]
+    fn country_allowlist_narrows_submissions() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        let food = sym(&env, "Food");
+        env.mock_all_auths();
+
+        client.set_country_allowlist(&admin, &vec![&env, sym(&env, "NG")]);
+        assert_eq!(client.get_country_allowlist().len(), 1);
+
+        // In the allowlist: accepted.
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &food, 100, 10);
+        // Not in the allowlist: refused before auth and before storage.
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "KE"),
+                    &food,
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::CountryNotAllowed
+        );
+        assert!(client.get(&sym(&env, "KE"), &food, &10).is_none());
+    }
+
+    #[test]
+    fn category_allowlist_narrows_submissions() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_category_allowlist(&admin, &vec![&env, sym(&env, "Food")]);
+        assert_eq!(client.get_category_allowlist().len(), 1);
+
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        assert_eq!(
+            client
+                .try_submit(
+                    &submitter,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Rent"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::CategoryNotAllowed
+        );
+        assert!(client.get(&sym(&env, "NG"), &sym(&env, "Rent"), &10).is_none());
+    }
+
+    #[test]
+    fn an_empty_allowlist_imposes_no_restriction() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_country_allowlist(&admin, &vec![&env, sym(&env, "NG")]);
+        client.set_category_allowlist(&admin, &vec![&env, sym(&env, "Food")]);
+
+        // Clearing both restores registry-only behaviour.
+        client.set_country_allowlist(&admin, &vec![&env]);
+        client.set_category_allowlist(&admin, &vec![&env]);
+
+        submit_ok(&client, &submitter, &sym(&env, "KE"), &sym(&env, "Rent"), 100, 10);
+        assert!(client.get(&sym(&env, "KE"), &sym(&env, "Rent"), &10).is_some());
+    }
+
+    #[test]
+    fn a_submitter_may_be_confined_to_specific_categories() {
+        let env = make_env();
+        let (client, admin, baker) = deploy_with_admin(&env);
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+
+        // The baker may write Food and Rent only.
+        client.set_authorizations(
+            &admin,
+            &vec![
+                &env,
+                Authorization {
+                    submitter: baker.clone(),
+                    categories: vec![&env, sym(&env, "Food"), sym(&env, "Rent")],
+                },
+            ],
+        );
+        assert_eq!(client.get_authorizations().len(), 1);
+
+        submit_ok(&client, &baker, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        // Allowed category, refused category.
+        assert_eq!(
+            client
+                .try_submit(
+                    &baker,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Utilities"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::SubmitterNotAllowed
+        );
+        // A submitter with no entry at all is refused under a non-empty policy.
+        assert_eq!(
+            client
+                .try_submit(
+                    &stranger,
+                    &sym(&env, "NG"),
+                    &sym(&env, "Food"),
+                    &100,
+                    &10_u64,
+                    &DEFAULT_VALIDITY_WINDOW_SECS,
+                )
+                .unwrap_err()
+                .unwrap(),
+            Error::SubmitterNotAllowed
+        );
+        assert!(client.is_submitter_authorized(&baker, &sym(&env, "Rent")));
+        assert!(!client.is_submitter_authorized(&baker, &sym(&env, "Utilities")));
+    }
+
+    #[test]
+    fn an_authorization_with_no_categories_grants_every_category() {
+        let env = make_env();
+        let (client, admin, submitter) = deploy_with_admin(&env);
+        env.mock_all_auths();
+
+        client.set_authorizations(
+            &admin,
+            &vec![
+                &env,
+                Authorization {
+                    submitter: submitter.clone(),
+                    categories: Vec::new(&env),
+                },
+            ],
+        );
+
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Health"), 100, 10);
+        assert!(client.is_submitter_authorized(&submitter, &sym(&env, "Health")));
+    }
+
+    #[test]
+    fn an_unconfigured_contract_accepts_any_registry_submission() {
+        // No initialize: the allowlists are empty and impose nothing, so
+        // pre-existing behaviour is unchanged.
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        env.mock_all_auths();
+
+        assert_eq!(client.admin(), None);
+        submit_ok(&client, &submitter, &sym(&env, "NG"), &sym(&env, "Food"), 100, 10);
+        assert!(client.get(&sym(&env, "NG"), &sym(&env, "Food"), &10).is_some());
+        assert!(client.is_country_allowed(&sym(&env, "KE")));
+        assert!(client.is_category_allowed(&sym(&env, "Rent")));
+        assert!(client.is_submitter_authorized(&submitter, &sym(&env, "Food")));
+    }
+
+    // -- Transition table view (CT-56) -----------------------------------
+
+    #[test]
+    fn the_public_transition_view_matches_the_enforced_table() {
+        let env = make_env();
+        let client = deploy(&env);
+        let statuses = [
+            SubmissionStatus::Pending,
+            SubmissionStatus::Verified,
+            SubmissionStatus::Rejected,
+        ];
+
+        for from in statuses.iter() {
+            for to in statuses.iter() {
+                // The view and the mutator's table must never disagree.
+                assert_eq!(
+                    client.can_transition(from, to),
+                    from.can_transition_to(to),
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Verified));
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Rejected));
+        assert!(!client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Pending));
+        assert!(!client.can_transition(&SubmissionStatus::Verified, &SubmissionStatus::Pending));
+        assert!(!client.can_transition(&SubmissionStatus::Verified, &SubmissionStatus::Rejected));
+        assert!(!client.can_transition(&SubmissionStatus::Rejected, &SubmissionStatus::Verified));
+    }
+
+    #[test]
+    fn the_transition_view_predicts_what_set_status_will_do() {
+        let env = make_env();
+        let client = deploy(&env);
+        let submitter = Address::generate(&env);
+        let verifier = Address::generate(&env);
+        let country = sym(&env, "NG");
+        let category = sym(&env, "Food");
+        env.mock_all_auths();
+
+        submit_ok(&client, &submitter, &country, &category, 1_000, 100);
+
+        // Pending -> Verified is advertised as allowed, and is allowed.
+        assert!(client.can_transition(&SubmissionStatus::Pending, &SubmissionStatus::Verified));
+        client
+            .set_status(&verifier, &country, &category, &100, &SubmissionStatus::Verified)
+            .unwrap();
+
+        // Every transition out of the terminal state is advertised refused,
+        // and is refused with the stable InvalidTransition code.
+        for next in [
+            SubmissionStatus::Pending,
+            SubmissionStatus::Verified,
+            SubmissionStatus::Rejected,
+        ] {
+            assert!(!client.can_transition(&SubmissionStatus::Verified, &next));
+            assert_eq!(
+                client
+                    .try_set_status(&verifier, &country, &category, &100, &next)
+                    .unwrap_err()
+                    .unwrap(),
+                Error::InvalidTransition
+            );
+        }
+    }
+
+    #[test]
+    fn safe_arithmetic_entry_points() {
+        let env = make_env();
+        let client = deploy(&env);
+        assert_eq!(client.safe_add(&10, &20), Ok(30));
+        assert_eq!(client.safe_mul(&6, &7), Ok(42));
+        assert_eq!(
+            client.try_safe_add(&i128::MAX, &1).unwrap_err().unwrap(),
+            Error::ArithmeticOverflow
+        );
+        assert_eq!(
+            client.try_safe_mul(&i128::MAX, &2).unwrap_err().unwrap(),
+            Error::ArithmeticOverflowMul
+        );
+    }
+
+    #[test]
+    fn validate_submit_payload_commits_no_state() {
+        let env = make_env();
+        let client = deploy(&env);
+
+        assert!(client
+            .validate_submit_payload(&sym(&env, "KE"), &sym(&env, "Rent"), &500, &50)
+            .is_ok());
+        assert_eq!(
+            client
+                .try_validate_submit_payload(&sym(&env, "KE"), &sym(&env, "Rent"), &-1, &50)
+                .unwrap_err()
+                .unwrap(),
+            Error::NegativeNotAllowed
+        );
+        // Nothing was written.
+        assert!(client.get(&sym(&env, "KE"), &sym(&env, "Rent"), &50).is_none());
+    }
+
+    // ── constants ───────────────────────────────────────────────────────
+
+    #[test]
+    fn documented_constants_hold() {
+        assert_eq!(DEFAULT_VALIDITY_WINDOW_SECS, 86_400);
+        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(registry::VERSION, 1);
+    }
         submit_ok(&client, &submitter, &country, &category, 1, 1);
         submit_ok(&client, &submitter, &country, &category, 2, 2);
 
