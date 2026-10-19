@@ -86,15 +86,43 @@ The result is a uniform contract:
 | `400 LIMIT_EXCEEDED` | `limit` above the endpoint's maximum |
 | `400 INVALID_ID` | Non-numeric or negative resource id |
 | `400 INVALID_CURSOR` | Non-string or oversized pagination cursor |
+| `400 INVALID_CONTENT` | Post content missing, blank, over the 280-character limit, or not a string |
+| `400 INVALID_FIELD` | A profile field failed validation (currently `username`) |
+
+### Bounded free text (issue #921)
+
+`posts.content` is a plain `TEXT` column with no length constraint, so an
+oversized post is stored happily and only fails later — when a client renders
+it, or when a list endpoint serializes it. The bound is therefore applied at the
+API edge by `parsePostContent` in `src/api/validation.ts`:
+
+- The limit is **280 UTF-16 code units**, matching the cap the web client
+  enforces, so a post the UI accepts is never rejected by the API.
+- The **submitted value is measured verbatim**, not a trimmed copy. Content is
+  stored as submitted, so trimming before measuring would silently rewrite the
+  post and let padding slip past the limit.
+- Empty or whitespace-only content is `INVALID_CONTENT` rather than an empty
+  post row.
 
 ### Profiles
 
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/v1/profiles/:address` | Returns the profile object. |
+| PUT | `/api/v1/profiles/:address` | Updates `username` (required) and `creator_token` (optional). |
 
 - `400 INVALID_ADDRESS` — address missing/blank, or not a base-32 `G…` Stellar public key (see [Request validation](#request-validation-issue-665)).
 - `404 NOT_FOUND` — no profile for that address.
+- `400 INVALID_FIELD` — `username` missing, blank, or longer than 32 characters.
+- `400 INVALID_ADDRESS` — `creator_token` present but not a Stellar public key.
+
+**Profile updates are all-or-nothing (issue #923).** Every field is validated
+before anything is written and the handler issues at most one write, so a
+request carrying one bad field never applies the others. Validating field by
+field inside the write loop is precisely what produces partial updates: the
+profile ends up with the new username and the old creator token, with nothing in
+the response to say half the request was refused. Omitting `creator_token`
+leaves the stored value untouched rather than clearing it.
 
 **The response shape is stable (issue #926).** A profile always serializes with
 the same four keys, whatever the row happens to contain:
