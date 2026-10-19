@@ -7,7 +7,7 @@
  *  - Database calls mocked with jest.mock
  */
 
-import { handleFollow, handleUnfollow, FollowEvent, UnfollowEvent } from "../follow";
+import { handleFollow, handleUnfollow, isSelfFollow, FollowEvent, UnfollowEvent } from "../follow";
 import { Database } from "../../db";
 
 jest.mock("../../db");
@@ -435,5 +435,65 @@ describe("handleUnfollow — repeated deliveries (issue #931)", () => {
 
     expect(db.deleteFollow).not.toHaveBeenCalled();
     expect(relationships.size).toBe(0);
+  });
+});
+
+/**
+ * Self-follow rejection (BE-13).
+ *
+ * The rule is enforced in the write path with no database call, so a rejected
+ * event cannot leave any state behind.
+ */
+describe("handleFollow � self-follow (BE-13)", () => {
+  let db: jest.Mocked<Database>;
+
+  const ADDRESS = `G${"A".repeat(55)}`;
+  const OTHER = `G${"B".repeat(55)}`;
+
+  beforeEach(() => {
+    db = makeMockDb();
+  });
+
+  it("rejects an exact self-follow and touches no database state", async () => {
+    await expect(
+      handleFollow(db, { follower: ADDRESS, followee: ADDRESS, ledger: 5 })
+    ).rejects.toThrow(/cannot follow itself/);
+
+    expect(db.getFollow).not.toHaveBeenCalled();
+    expect(db.insertFollow).not.toHaveBeenCalled();
+    expect(db.deleteFollow).not.toHaveBeenCalled();
+  });
+
+  it("rejects a self-follow that differs only in casing", async () => {
+    await expect(
+      handleFollow(db, {
+        follower: ADDRESS,
+        followee: ADDRESS.toLowerCase(),
+        ledger: 5,
+      })
+    ).rejects.toThrow(/cannot follow itself/);
+
+    expect(db.insertFollow).not.toHaveBeenCalled();
+  });
+
+  it("identifies a self-follow regardless of whitespace", () => {
+    expect(isSelfFollow(ADDRESS, ADDRESS)).toBe(true);
+    expect(isSelfFollow(ADDRESS, ` ${ADDRESS.toLowerCase()} `)).toBe(true);
+    expect(isSelfFollow(ADDRESS, OTHER)).toBe(false);
+  });
+
+  it("does not treat a structurally invalid address as a self-follow", () => {
+    // Validity is the per-field check's job; claiming "self-follow" here would
+    // report the wrong reason for the rejection.
+    expect(isSelfFollow("not-an-address", "not-an-address")).toBe(false);
+  });
+
+  it("still follows a different account", async () => {
+    await handleFollow(db, { follower: ADDRESS, followee: OTHER, ledger: 5 });
+    expect(db.insertFollow).toHaveBeenCalledWith({
+      follower: ADDRESS,
+      followee: OTHER,
+      ledger: 5,
+    });
   });
 });

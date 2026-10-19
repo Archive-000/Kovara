@@ -258,3 +258,131 @@ describe("handleProfileSet — stale event protection (issue #927)", () => {
     expect(db.upsertProfile).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Replay safety (BE-07).
+ *
+ * `ProfileSet` states a desired end state, so applying N deliveries must leave
+ * exactly the profile that applying one delivery would. The ledger comparison
+ * covers both halves of "replay": a redelivery of the event already applied
+ * (`ledger ===`), and a replayed older one (`ledger <`).
+ */
+describe("handleProfileSet � replay safety (BE-07)", () => {
+  function makeDb(existing?: {
+    address: string;
+    username: string;
+    creator_token: string;
+    updated_ledger: number;
+  }) {
+    return {
+      getProfile: jest.fn().mockResolvedValue(existing ?? null),
+      upsertProfile: jest.fn().mockResolvedValue(undefined),
+      getFollow: jest.fn(),
+      insertFollow: jest.fn(),
+      deleteFollow: jest.fn(),
+      insertPost: jest.fn(),
+      markPostDeleted: jest.fn(),
+      incrementPostLikeCount: jest.fn(),
+      addPostTipTotal: jest.fn(),
+      getPost: jest.fn(),
+      upsertLike: jest.fn(),
+      insertTip: jest.fn(),
+      upsertPool: jest.fn(),
+      adjustPoolBalance: jest.fn(),
+      insertPool: jest.fn(),
+      getPool: jest.fn(),
+      listPools: jest.fn().mockResolvedValue({ pools: [], total: 0 }),
+      addPoolAdmin: jest.fn(),
+      removePoolAdmin: jest.fn(),
+      listProfiles: jest.fn().mockResolvedValue({ profiles: [], total: 0 }),
+      listPosts: jest.fn(),
+      getFollowers: jest.fn(),
+      getFollowing: jest.fn(),
+      getFollowersAfter: jest.fn(),
+      getFollowingAfter: jest.fn(),
+      searchPosts: jest.fn().mockResolvedValue({ posts: [], total: 0 }),
+      getTokenMetadata: jest.fn().mockResolvedValue(null),
+    } as jest.Mocked<Database>;
+  }
+
+  const stored = {
+    address: "GA",
+    username: "alice",
+    creator_token: "T",
+    updated_ledger: 100,
+  };
+
+  it("ignores a redelivery of the event already applied", async () => {
+    const db = makeDb({ ...stored });
+
+    await handleProfileSet(db, {
+      user: "GA",
+      username: "alice",
+      creator_token: "T",
+      ledger: 100,
+    });
+
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("ignores a replayed older event carrying a different username", async () => {
+    const db = makeDb({ ...stored });
+
+    await handleProfileSet(db, {
+      user: "GA",
+      username: "impostor",
+      creator_token: "X",
+      ledger: 99,
+    });
+
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("writes nothing for a burst that contains no event newer than the stored one", async () => {
+    const db = makeDb({ ...stored });
+
+    for (const ledger of [98, 97, 100]) {
+      await handleProfileSet(db, {
+        user: "GA",
+        username: `name-${ledger}`,
+        creator_token: "T",
+        ledger,
+      });
+    }
+
+    // Stored ledger is 100, so nothing in this burst may write — not even the
+    // event that ties it.
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("applies an event that is strictly newer than the stored ledger", async () => {
+    const db = makeDb({ ...stored });
+
+    await handleProfileSet(db, {
+      user: "GA",
+      username: "alice2",
+      creator_token: "T",
+      ledger: 101,
+    });
+
+    expect(db.upsertProfile).toHaveBeenCalledTimes(1);
+    expect(db.upsertProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "alice2", updated_ledger: 101 })
+    );
+  });
+
+  it("matches the stored row even when the event carries a different casing", async () => {
+    // A replayed event must not miss the row and open a second profile.
+    const db = makeDb({ ...stored, address: "GA" });
+
+    await handleProfileSet(db, {
+      user: "ga",
+      username: "alice",
+      creator_token: "T",
+      ledger: 100,
+    });
+
+    expect(db.getProfile).toHaveBeenCalledWith("GA");
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+});
