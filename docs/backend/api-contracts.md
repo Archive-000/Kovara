@@ -86,15 +86,69 @@ The result is a uniform contract:
 | `400 LIMIT_EXCEEDED` | `limit` above the endpoint's maximum |
 | `400 INVALID_ID` | Non-numeric or negative resource id |
 | `400 INVALID_CURSOR` | Non-string or oversized pagination cursor |
+| `400 INVALID_CONTENT` | Post content missing, blank, over the 280-character limit, or not a string |
+| `400 INVALID_FIELD` | A profile field failed validation (currently `username`) |
+
+### Bounded free text (issue #921)
+
+`posts.content` is a plain `TEXT` column with no length constraint, so an
+oversized post is stored happily and only fails later — when a client renders
+it, or when a list endpoint serializes it. The bound is therefore applied at the
+API edge by `parsePostContent` in `src/api/validation.ts`:
+
+- The limit is **280 UTF-16 code units**, matching the cap the web client
+  enforces, so a post the UI accepts is never rejected by the API.
+- The **submitted value is measured verbatim**, not a trimmed copy. Content is
+  stored as submitted, so trimming before measuring would silently rewrite the
+  post and let padding slip past the limit.
+- Empty or whitespace-only content is `INVALID_CONTENT` rather than an empty
+  post row.
 
 ### Profiles
 
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/v1/profiles/:address` | Returns the profile object. |
+| PUT | `/api/v1/profiles/:address` | Updates `username` (required) and `creator_token` (optional). |
 
 - `400 INVALID_ADDRESS` — address missing/blank, or not a base-32 `G…` Stellar public key (see [Request validation](#request-validation-issue-665)).
 - `404 NOT_FOUND` — no profile for that address.
+- `400 INVALID_FIELD` — `username` missing, blank, or longer than 32 characters.
+- `400 INVALID_ADDRESS` — `creator_token` present but not a Stellar public key.
+
+**Profile updates are all-or-nothing (issue #923).** Every field is validated
+before anything is written and the handler issues at most one write, so a
+request carrying one bad field never applies the others. Validating field by
+field inside the write loop is precisely what produces partial updates: the
+profile ends up with the new username and the old creator token, with nothing in
+the response to say half the request was refused. Omitting `creator_token`
+leaves the stored value untouched rather than clearing it.
+
+**The response shape is stable (issue #926).** A profile always serializes with
+the same four keys, whatever the row happens to contain:
+
+| Key | Type | When unset |
+| --- | --- | --- |
+| `address` | string | never — it is the primary key |
+| `username` | string | `""` |
+| `creator_token` | string | `""` |
+| `updated_ledger` | integer | `0` |
+
+A row that has never had a `creator_token`, or that predates a column being
+added, comes back from Postgres with that property absent. Passing it straight
+through would drop the key entirely, so the same account serializes differently
+depending on which columns happen to be populated — and a client has to treat a
+missing key and an explicit value as two different things. Normalizing here
+means the keys are always present, so `'creator_token' in profile` and any
+generated type agree with the documented shape.
+
+**Address casing (issue #925).** A Stellar strkey is base-32 over `A–Z` and
+`2–7`, so **upper case is the canonical form**. `normalizeAddress` trims, folds
+to upper case and then validates the folded value, so every caller gets the same
+string back for the same account. Without this, a profile created from `gabc…`
+is not found again by a lookup for `GABC…` and a second row is created for the
+same account. Folding happens *before* validation so the character set is still
+checked exactly: `0`, `1`, `8` and `9` remain rejected in either case.
 
 ### Posts
 
@@ -176,6 +230,15 @@ Errors: `400 INVALID_QUERY`, `400 QUERY_TOO_LONG`, `400 LIMIT_EXCEEDED`,
 `500 SEARCH_UNAVAILABLE`.
 
 ### Follows
+
+An account cannot follow itself. The rule is enforced in the **write path**
+(`handleFollow`), not only where a follow is read back, so a self-follow is
+refused with no database call and leaves no state behind (issue #930). A
+self-follow is a meaningless edge: it inflates both the follower and the
+following count of one account while the edge is invisible in either list,
+because a client filters `x !== self`. Comparing the *canonical* addresses means
+a contract emitting `GABC…` and an API caller sending `gabc…` cannot slip a
+self-follow past each other.
 
 | Method | Path | Notes |
 | --- | --- | --- |

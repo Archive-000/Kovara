@@ -204,3 +204,100 @@ describe("input validation across public endpoints (#665)", () => {
     expect(db.getFollowers).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Profile updates (BE-06).
+ *
+ * The contract under test is "no partial write": a request carrying one
+ * invalid field must be refused whole, with the offending field named, and the
+ * store must not be touched at all.
+ */
+describe("profile update field validation (BE-06)", () => {
+  let db: jest.Mocked<Database>;
+  let app: ReturnType<typeof createApp>;
+
+  const existing = {
+    address: VALID,
+    username: "oldname",
+    creator_token: "",
+    updated_ledger: 10,
+  };
+
+  beforeEach(() => {
+    db = makeMockDb();
+    db.getProfile.mockResolvedValue(existing);
+    app = createApp(db);
+  });
+
+  it("writes once when every field is valid", async () => {
+    const res = await request(app).put(`/api/profiles/${VALID}`).send({ username: "newname" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ username: "newname" });
+    expect(db.upsertProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an empty username without writing", async () => {
+    const res = await request(app).put(`/api/profiles/${VALID}`).send({ username: "   " });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_FIELD" });
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("names the field that failed on a malformed creator token", async () => {
+    const res = await request(app)
+      .put(`/api/profiles/${VALID}`)
+      .send({ username: "newname", creator_token: "not-an-address" });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_ADDRESS" });
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("does not apply the valid username when a later field is invalid", async () => {
+    // The partial-update regression: `username` parses, `creator_token` does
+    // not, and the profile must keep both of its original values.
+    const res = await request(app)
+      .put(`/api/profiles/${VALID}`)
+      .send({ username: "newname", creator_token: "G" + "0".repeat(55) });
+
+    expect(res.status).toBe(400);
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing body as an empty username", async () => {
+    const res = await request(app).put(`/api/profiles/${VALID}`).send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_FIELD" });
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed address before reading the profile", async () => {
+    const res = await request(app).put(`/api/profiles/${BAD_SHORT}`).send({ username: "newname" });
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_ADDRESS" });
+    expect(db.getProfile).not.toHaveBeenCalled();
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("404s when the profile does not exist", async () => {
+    db.getProfile.mockResolvedValueOnce(null);
+    const res = await request(app).put(`/api/profiles/${VALID}`).send({ username: "newname" });
+
+    expect(res.status).toBe(404);
+    expect(db.upsertProfile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the stored creator token when the field is omitted", async () => {
+    db.getProfile.mockResolvedValueOnce({ ...existing, creator_token: VALID_2 });
+    const res = await request(app).put(`/api/profiles/${VALID}`).send({ username: "newname" });
+
+    expect(res.status).toBe(200);
+    expect(db.upsertProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ username: "newname", creator_token: VALID_2 })
+    );
+  });
+});

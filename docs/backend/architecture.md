@@ -155,6 +155,34 @@ active request context exists; calls made without request context leave the body
 unchanged. The same ID is echoed in `X-Request-Id` and the legacy
 `X-Correlation-Id` response headers. Successful JSON responses are not modified.
 
+### Feed ordering and the tie policy (issue #922)
+
+Feed ranking (`Backend/src/feed/ranking.ts`) is pure and explainable: the same
+candidates and the same clock always produce the same order. Three modes answer
+different questions — `ranked` (weighted engagement + recency), `recent` (strict
+reverse-chronological) and `trending` (engagement *rate* over a bounded window).
+
+Every mode is given a **total order**, not just a score:
+
+- Scores are rounded to six decimal places *before* comparison, so two posts
+  that differ only below that precision are treated as tied rather than being
+  ordered by floating-point noise.
+- Ties are broken by **`id` descending** (`FEED_TIE_BREAK = "id_desc"`). Post ids
+  are unique and monotonic, so this is stable across requests and independent of
+  the order the rows came back from Postgres.
+- Entries with no usable score (`-Infinity` — `recent` mode with no timestamp,
+  trending outside the window) always sort after scored ones and are tied among
+  themselves by the same `id` rule.
+- Soft-deleted posts are dropped before ranking, not ranked last.
+
+Tied timestamps are the case this exists for. Two posts written in the same
+ledger second score identically, and without a trailing unique key Postgres is
+free to return those rows in any order — so a client paging with `offset` sees
+one row twice and never sees the other. The `id_desc` tie-break makes the order
+independent of arrival order, which is what "stable results" means here. The
+policy is echoed in every response as `ranking.tie_break`, so a client can see
+why two equal-scoring posts came back in the order they did.
+
 ### Reward rule precedence (issue #975)
 
 `assessSubmission` is a pure function: the same submission and verifications
@@ -273,6 +301,30 @@ the cap is still exceeded, expired buckets are removed first and then the least
 recently used. A bucket that is being used is moved to the most-recent end on
 every hit, so cleanup does not reset the limit of an active address; only idle
 addresses are evicted. The store is per-process and in memory.
+
+### Profile event replay safety (issue #924)
+
+`ProfileSet` states a desired **end state** — "this account's profile *is* this"
+— not a transition that may only happen once. The chain redelivers events after
+a crash, inside a replay window, or over an at-least-once transport, so applying
+N deliveries must leave exactly the profile that applying one would.
+
+`handleProfileSet` guarantees that with two rules:
+
+1. **Strictly-newer ledger only.** An event whose ledger is not greater than the
+   stored `updated_ledger` is ignored. That covers both halves of a replay: a
+   redelivery of the event already applied (`ledger ===`) and a replayed older
+   one (`ledger <`, the out-of-order case first raised in issue #927). The
+   newest *valid* state therefore always wins, and a duplicate can never
+   overwrite it — including a duplicate that carries a different username.
+2. **Canonical lookup key.** `event.user` is trimmed and folded to upper case
+   before the read *and* the write, so an event carrying `gabc…` resolves to the
+   row written as `GABC…` (issue #925). Without this a replayed event can miss
+   the existing row, take the "no profile yet" branch and open a second profile
+   for the same account.
+
+A `ProfileSet` with no stored profile is applied unconditionally — the first
+event is always the current state.
 
 ### Repeated-unfollow semantics (issue #931)
 

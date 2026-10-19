@@ -51,7 +51,7 @@ describe("API Routes", () => {
     app = createApp(db);
   });
 
-  // ── Health ────────────────────────────────────────────────────────────────
+  // â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /health", () => {
     it("returns 200 with status ok when DB is reachable", async () => {
@@ -79,7 +79,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Correlation IDs ─────────────────────────────────────────────────────
+  // â”€â”€ Correlation IDs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Correlation IDs", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -112,7 +112,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Profiles ──────────────────────────────────────────────────────────────
+  // â”€â”€ Profiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/profiles/:address", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -210,7 +210,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Posts ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Posts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/posts", () => {
     it("lists posts with default pagination", async () => {
@@ -310,7 +310,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Follows ───────────────────────────────────────────────────────────────
+  // â”€â”€ Follows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/follows/:address/followers", () => {
     it("returns followers list", async () => {
@@ -378,7 +378,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Pools ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Pools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/pools/:id", () => {
     it("returns a pool when found", async () => {
@@ -499,7 +499,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Search ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("POST /api/search/posts", () => {
     it("returns 400 when query is missing", async () => {
@@ -639,7 +639,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── BigInt serialization ─────────────────────────────────────────────
+  // â”€â”€ BigInt serialization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("BigInt serialization", () => {
     it("serializes tip_total and like_count as strings in posts list", async () => {
@@ -669,7 +669,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Empty-result pagination (BE-30) ──────────────────────────────────────
+  // â”€â”€ Empty-result pagination (BE-30) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Empty-result pagination", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -794,7 +794,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Error handler ─────────────────────────────────────────────────────────
+  // â”€â”€ Error handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Error handler", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -821,7 +821,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Malformed JSON (BE-19) ────────────────────────────────────────────────
+  // â”€â”€ Malformed JSON (BE-19) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("POST /api/search/posts (malformed JSON)", () => {
     it("returns 400 with MALFORMED_JSON code for invalid JSON body (BE-19)", async () => {
@@ -889,7 +889,7 @@ describe("API Routes", () => {
  *
  * The offset style must keep working untouched; the cursor style is additive.
  */
-describe("GET /api/posts � cursor pagination (BE-01)", () => {
+describe("GET /api/posts — cursor pagination (BE-01)", () => {
   let db: jest.Mocked<Database>;
   let app: ReturnType<typeof createApp>;
 
@@ -911,6 +911,15 @@ describe("GET /api/posts � cursor pagination (BE-01)", () => {
   const first = makePost(3, "2026-01-01T00:00:00.000Z");
   const second = makePost(2, "2026-01-01T00:00:00.000Z");
   const third = makePost(1, "2026-01-01T00:00:00.000Z");
+
+ * Stable profile serialization (BE-09).
+ *
+ * The response always carries every documented key, so a client never has to
+ * distinguish "missing" from "explicitly null".
+ */
+describe("GET /profiles/:address — response shape (BE-09)", () => {
+  let db: jest.Mocked<Database>;
+  let app: ReturnType<typeof createApp>;
 
   beforeEach(() => {
     db = makeMockDb();
@@ -984,7 +993,7 @@ describe("GET /api/posts � cursor pagination (BE-01)", () => {
   });
 
   it("rejects a well-formed but wrong-shaped cursor", async () => {
-    // base64url of `{"created_at":"2026-01-01","id":"abc"}` � the id is not numeric.
+    // base64url of `{"created_at":"2026-01-01","id":"abc"}` — the id is not numeric.
     const cursor = Buffer.from(
       JSON.stringify({ created_at: "2026-01-01T00:00:00.000Z", id: "abc" }),
       "utf8"
@@ -1011,7 +1020,7 @@ describe("GET /api/posts � cursor pagination (BE-01)", () => {
  * "Already deleted" and "never existed" are different answers and must not both
  * look like a 404.
  */
-describe("DELETE /api/posts/:id � response semantics (BE-03)", () => {
+describe("DELETE /api/posts/:id — response semantics (BE-03)", () => {
   let db: jest.Mocked<Database>;
   let app: ReturnType<typeof createApp>;
 
@@ -1077,7 +1086,7 @@ describe("DELETE /api/posts/:id � response semantics (BE-03)", () => {
     db.getPost.mockResolvedValueOnce(null);
     const missing = await request(app).delete("/api/posts/42");
 
-    // Same status, different body � the client can tell "retry is pointless"
+    // Same status, different body — the client can tell "retry is pointless"
     // from "retry is safe" without parsing prose.
     expect(already.body.deleted).toBe(false);
     expect(missing.body.code).toBe("NOT_FOUND");
@@ -1089,5 +1098,69 @@ describe("DELETE /api/posts/:id � response semantics (BE-03)", () => {
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ code: "INVALID_ID" });
     expect(db.getPost).not.toHaveBeenCalled();
+  it("returns every documented key for a fully populated profile", async () => {
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+      creator_token: OTHER_ADDRESS,
+      updated_ledger: 42,
+    });
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+  });
+
+  it("keeps the same keys when optional fields were never set", async () => {
+    // A row written before a column existed comes back from Postgres without it.
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+    } as never);
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+    expect(res.body.creator_token).toBe("");
+    expect(res.body.updated_ledger).toBe(0);
+  });
+
+  it("never drops a key that holds an explicit null", async () => {
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+      creator_token: null,
+      updated_ledger: null,
+    } as never);
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+    expect(res.body.creator_token).toBe("");
+    expect(res.body.updated_ledger).toBe(0);
+  });
+
+  it("still 404s for a genuinely missing profile", async () => {
+    db.getProfile.mockResolvedValueOnce(null);
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+    expect(res.status).toBe(404);
   });
 });

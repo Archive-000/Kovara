@@ -30,10 +30,27 @@ export function validateProfileEvent(event: unknown): asserts event is ProfileSe
 /**
  * Handle a ProfileSet event emitted by the Kovara contract.
  *
- * Protects against out-of-order delivery (issue #927): stale events — ones
- * with an `updated_ledger` that is <= the stored profile's `updated_ledger` —
- * must be ignored so newer profile state is not overwritten by a replayed
- * older event. If no profile exists, apply the first event unconditionally.
+ * Replay safety (BE-07) has two halves, and both are needed:
+ *
+ *  1. **The event is a state assertion, not a transition.** A `ProfileSet`
+ *     states "this account's profile *is* this", so applying N deliveries of it
+ *     must leave the same profile as applying one. That is guaranteed by
+ *     comparing ledgers: an event whose ledger is not strictly newer than the
+ *     stored `updated_ledger` is ignored, which covers both a redelivery of an
+ *     already-applied event (`ledger ===`) and a replayed older one
+ *     (`ledger <`) — the out-of-order case first raised in issue #927. The
+ *     newest *valid* state therefore always wins, and a duplicate can never
+ *     overwrite it.
+ *  2. **The lookup key is canonical.** `event.user` is trimmed and folded to
+ *     upper case before it is used, so an event carrying `gabc…` resolves to the
+ *     same row as the `GABC…` written earlier. Skipping this would let a
+ *     replayed event miss the existing row entirely, take the "no profile yet"
+ *     branch and write a second profile for the same account. This mirrors
+ *     `normalizeAddress` (BE-08) but deliberately does not re-validate the
+ *     strkey: the shape was already checked when the event was ingested, and
+ *     rejecting it here would drop an otherwise valid profile.
+ *
+ * If no profile exists, the first event is applied unconditionally.
  */
 export async function handleProfileSet(db: Database, event: ProfileSetEvent): Promise<void> {
   if (!event.user) {
@@ -43,21 +60,24 @@ export async function handleProfileSet(db: Database, event: ProfileSetEvent): Pr
     throw new Error("ProfileSet event missing required field: username");
   }
 
+  // One canonical key for both the read and the write below.
+  const address = event.user.trim().toUpperCase();
+
   const trimmedUsername = event.username.trim();
   if (trimmedUsername === "") {
     throw new Error("ProfileSet event username must be non-empty after trimming");
   }
 
-  const existing = await db.getProfile(event.user);
+  const existing = await db.getProfile(address);
   if (existing && event.ledger <= existing.updated_ledger) {
     logger.info(
-      `Skipping stale ProfileSet for ${event.user} (event ledger ${event.ledger}, stored ledger ${existing.updated_ledger})`
+      `Skipping replayed/stale ProfileSet for ${address} (event ledger ${event.ledger}, stored ledger ${existing.updated_ledger})`
     );
     return;
   }
 
   await db.upsertProfile({
-    address: event.user,
+    address,
     username: trimmedUsername,
     creator_token: event.creator_token ?? "",
     updated_ledger: event.ledger,
