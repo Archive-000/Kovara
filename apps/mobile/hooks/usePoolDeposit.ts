@@ -139,6 +139,11 @@ declare global {
 /**
  * MO-007: Signs, submits, and confirms a real pool deposit via the SDK and
  * wallet kit. Returns the Stellar transaction hash (not a random mock).
+ *
+ * FE-19: on failure the error is surfaced via `error` and the caller retains
+ * the entered amount so the deposit can be retried. The hook does not clear
+ * the amount or success state on failure, and the form keeps its controlled input
+ * value intact.
  */
 export function usePoolDeposit(): UsePoolDepositReturn {
   const { address, connected } = useWallet();
@@ -198,6 +203,9 @@ export function usePoolDeposit(): UsePoolDepositReturn {
       } catch (err) {
         const message =
           err instanceof Error ? err.message : "Deposit failed. Please try again.";
+        // FE-19: surface a retryable error while keeping the caller's amount intact.
+        // We do not clear any amount state here (the hook does not own it) and we
+        // keep the error available for the form to render a retry affordance.
         setError(message);
         setSuccess(false);
       } finally {
@@ -222,4 +230,4 @@ export function usePoolDeposit(): UsePoolDepositReturn {
     deposit,
     reset,
   };
-  }
+}
