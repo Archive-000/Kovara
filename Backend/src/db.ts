@@ -250,6 +250,12 @@ export interface Database {
     author?: string;
     limit: number;
     offset: number;
+    /**
+     * Keyset boundary (BE-01). When present the query resumes strictly after
+     * `(created_at, id)` and `offset` is ignored, so a page does not shift when
+     * a post is created between two requests.
+     */
+    cursor?: { created_at: string; id: string };
   }): Promise<{ posts: Post[]; total: number }>;
   searchPosts(filters: {
     query: string;
@@ -780,12 +786,28 @@ export class PostgresDatabase implements Database {
     };
   }
 
+  /**
+   * Lists posts, newest first.
+   *
+   * Two pagination styles (BE-01):
+   *
+   *   - **Offset** (`cursor` absent) — the original `LIMIT/OFFSET` behaviour,
+   *     unchanged.
+   *   - **Keyset** (`cursor` present) — resumes strictly after the boundary row
+   *     encoded by the caller. Offset cannot express this: a post created
+   *     *between* two page requests shifts every later row by one, so the client
+   *     sees the row it already read and misses another. The comparison is on
+   *     the `(created_at, id)` pair rather than `created_at` alone, because many
+   *     posts share a ledger timestamp and a `created_at`-only comparison would
+   *     drop or repeat all of them.
+   */
   async listPosts(filters: {
     author?: string;
     limit: number;
     offset: number;
+    cursor?: { created_at: string; id: string };
   }): Promise<{ posts: Post[]; total: number }> {
-    const { author, limit, offset } = filters;
+    const { author, limit, offset, cursor } = filters;
     const values: unknown[] = [];
     let whereClause = "WHERE deleted_at IS NULL";
 
@@ -794,12 +816,37 @@ export class PostgresDatabase implements Database {
       whereClause += ` AND author = $${values.length}`;
     }
 
+    // `total` stays the count of everything matching the filter (not of the
+    // remaining suffix), so a client paging by cursor sees a stable total
+    // rather than one that shrinks on every page.
     const countResult = await this.pool.query(
       `SELECT COUNT(*)::int AS total FROM posts ${whereClause}`,
       values
     );
+
+    if (cursor) {
+      values.push(cursor.created_at, cursor.id);
+      const createdAtParam = values.length - 1;
+      const idParam = values.length;
+      const result = await this.pool.query(
+        `
+        SELECT * FROM posts
+        ${whereClause}
+          AND (created_at, id) < ($${createdAtParam}::timestamp, $${idParam}::bigint)
+        ORDER BY created_at DESC, id DESC
+        LIMIT $${values.length + 1}
+        `,
+        values
+      );
+
+      return {
+        posts: result.rows.map((row) => this.mapPost(row)),
+        total: Number(countResult.rows[0]?.total ?? 0),
+      };
+    }
+
     const result = await this.pool.query(
-      `SELECT * FROM posts ${whereClause} ORDER BY created_at DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      `SELECT * FROM posts ${whereClause} ORDER BY created_at DESC, id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
       [...values, limit, offset]
     );
 

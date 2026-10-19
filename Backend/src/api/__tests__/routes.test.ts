@@ -51,7 +51,7 @@ describe("API Routes", () => {
     app = createApp(db);
   });
 
-  // ── Health ────────────────────────────────────────────────────────────────
+  // â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /health", () => {
     it("returns 200 with status ok when DB is reachable", async () => {
@@ -79,7 +79,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Correlation IDs ─────────────────────────────────────────────────────
+  // â”€â”€ Correlation IDs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Correlation IDs", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -112,7 +112,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Profiles ──────────────────────────────────────────────────────────────
+  // â”€â”€ Profiles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/profiles/:address", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -210,7 +210,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Posts ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Posts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/posts", () => {
     it("lists posts with default pagination", async () => {
@@ -310,7 +310,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Follows ───────────────────────────────────────────────────────────────
+  // â”€â”€ Follows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/follows/:address/followers", () => {
     it("returns followers list", async () => {
@@ -378,7 +378,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Pools ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Pools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("GET /api/pools/:id", () => {
     it("returns a pool when found", async () => {
@@ -499,7 +499,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Search ─────────────────────────────────────────────────────────────────
+  // â”€â”€ Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("POST /api/search/posts", () => {
     it("returns 400 when query is missing", async () => {
@@ -639,7 +639,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── BigInt serialization ─────────────────────────────────────────────
+  // â”€â”€ BigInt serialization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("BigInt serialization", () => {
     it("serializes tip_total and like_count as strings in posts list", async () => {
@@ -669,7 +669,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Empty-result pagination (BE-30) ──────────────────────────────────────
+  // â”€â”€ Empty-result pagination (BE-30) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Empty-result pagination", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -794,7 +794,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Error handler ─────────────────────────────────────────────────────────
+  // â”€â”€ Error handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("Error handler", () => {
     const VALID_ADDRESS = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
@@ -821,7 +821,7 @@ describe("API Routes", () => {
     });
   });
 
-  // ── Malformed JSON (BE-19) ────────────────────────────────────────────────
+  // â”€â”€ Malformed JSON (BE-19) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   describe("POST /api/search/posts (malformed JSON)", () => {
     it("returns 400 with MALFORMED_JSON code for invalid JSON body (BE-19)", async () => {
@@ -885,12 +885,39 @@ describe("API Routes", () => {
     });
 
 /**
+ * Cursor pagination for post listing (BE-01).
+ *
+ * The offset style must keep working untouched; the cursor style is additive.
+ */
+describe("GET /api/posts — cursor pagination (BE-01)", () => {
+  let db: jest.Mocked<Database>;
+  let app: ReturnType<typeof createApp>;
+
+  function makePost(id: number, createdAt: string) {
+    return {
+      id: BigInt(id),
+      author: FOLLOW_ADDRESS,
+      content: "hello",
+      deleted: false,
+      tip_total: 0n,
+      like_count: 0n,
+      created_ledger: id,
+      deleted_ledger: null,
+      created_at: new Date(createdAt),
+      deleted_at: null,
+    };
+  }
+
+  const first = makePost(3, "2026-01-01T00:00:00.000Z");
+  const second = makePost(2, "2026-01-01T00:00:00.000Z");
+  const third = makePost(1, "2026-01-01T00:00:00.000Z");
+
  * Stable profile serialization (BE-09).
  *
  * The response always carries every documented key, so a client never has to
  * distinguish "missing" from "explicitly null".
  */
-describe("GET /profiles/:address � response shape (BE-09)", () => {
+describe("GET /profiles/:address — response shape (BE-09)", () => {
   let db: jest.Mocked<Database>;
   let app: ReturnType<typeof createApp>;
 
@@ -899,6 +926,178 @@ describe("GET /profiles/:address � response shape (BE-09)", () => {
     app = createApp(db);
   });
 
+  it("keeps offset pagination working and reports no cursor", async () => {
+    db.listPosts.mockResolvedValueOnce({ posts: [first], total: 9 });
+
+    const res = await request(app).get("/api/posts?limit=1&offset=2");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ total: 9, limit: 1, offset: 2, has_more: true });
+    expect(res.body.next_cursor).toBeNull();
+    expect(db.listPosts).toHaveBeenCalledWith(
+      expect.objectContaining({ offset: 2, cursor: undefined })
+    );
+  });
+
+  it("returns a cursor on a full page and null on the final page", async () => {
+    db.listPosts.mockResolvedValueOnce({ posts: [first, second], total: 5 });
+    const page1 = await request(app).get("/api/posts?limit=2");
+
+    expect(page1.status).toBe(200);
+    expect(typeof page1.body.next_cursor).toBe("string");
+    expect(page1.body.offset).toBeNull();
+    expect(page1.body.total).toBe(5);
+
+    db.listPosts.mockResolvedValueOnce({ posts: [third], total: 5 });
+    const page2 = await request(app).get(
+      `/api/posts?limit=2&cursor=${encodeURIComponent(page1.body.next_cursor)}`
+    );
+
+    expect(page2.status).toBe(200);
+    expect(page2.body.has_more).toBe(false);
+    expect(page2.body.next_cursor).toBeNull();
+  });
+
+  it("resumes strictly after the boundary row encoded in the cursor", async () => {
+    db.listPosts.mockResolvedValueOnce({ posts: [first, second], total: 5 });
+    const page1 = await request(app).get("/api/posts?limit=2");
+    const cursor = page1.body.next_cursor as string;
+
+    db.listPosts.mockResolvedValueOnce({ posts: [third], total: 5 });
+    await request(app).get(`/api/posts?limit=2&cursor=${encodeURIComponent(cursor)}`);
+
+    // The boundary is the *last* row of page 1 (id 2), carried with its
+    // timestamp so the comparison is unambiguous.
+    expect(db.listPosts).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        offset: 0,
+        cursor: { created_at: "2026-01-01T00:00:00.000Z", id: "2" },
+      })
+    );
+  });
+
+  it("returns an empty final page without a cursor", async () => {
+    db.listPosts.mockResolvedValueOnce({ posts: [], total: 5 });
+    const res = await request(app).get("/api/posts?limit=2");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ posts: [], has_more: false, next_cursor: null });
+  });
+
+  it("rejects a malformed cursor instead of silently restarting from page one", async () => {
+    const res = await request(app).get("/api/posts?cursor=not-a-cursor");
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_CURSOR" });
+    expect(db.listPosts).not.toHaveBeenCalled();
+  });
+
+  it("rejects a well-formed but wrong-shaped cursor", async () => {
+    // base64url of `{"created_at":"2026-01-01","id":"abc"}` — the id is not numeric.
+    const cursor = Buffer.from(
+      JSON.stringify({ created_at: "2026-01-01T00:00:00.000Z", id: "abc" }),
+      "utf8"
+    ).toString("base64url");
+
+    const res = await request(app).get(`/api/posts?cursor=${encodeURIComponent(cursor)}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_CURSOR" });
+    expect(db.listPosts).not.toHaveBeenCalled();
+  });
+
+  it("keeps the author filter working with a cursor", async () => {
+    db.listPosts.mockResolvedValueOnce({ posts: [], total: 0 });
+    await request(app).get(`/api/posts?author=${FOLLOW_ADDRESS}&cursor=${encodeURIComponent("eyJhIjoxfQ")}`);
+    // A wrong-shaped cursor is refused before the filter is even applied.
+    expect(db.listPosts).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Post deletion semantics (BE-03).
+ *
+ * "Already deleted" and "never existed" are different answers and must not both
+ * look like a 404.
+ */
+describe("DELETE /api/posts/:id — response semantics (BE-03)", () => {
+  let db: jest.Mocked<Database>;
+  let app: ReturnType<typeof createApp>;
+
+  const livePost = {
+    id: 42n,
+    author: FOLLOW_ADDRESS,
+    content: "hello",
+    deleted: false,
+    tip_total: 0n,
+    like_count: 0n,
+    created_ledger: 7,
+    deleted_ledger: null,
+    created_at: new Date("2026-01-01T00:00:00.000Z"),
+    deleted_at: null,
+  };
+
+  const deletedPost = {
+    ...livePost,
+    deleted: true,
+    deleted_ledger: 9,
+    deleted_at: new Date("2026-01-02T00:00:00.000Z"),
+  };
+
+  beforeEach(() => {
+    db = makeMockDb();
+    app = createApp(db);
+  });
+
+  it("soft-deletes a live post and reports deleted: true", async () => {
+    db.getPost.mockResolvedValueOnce(livePost);
+
+    const res = await request(app).delete("/api/posts/42");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "42", deleted: true });
+    expect(db.markPostDeleted).toHaveBeenCalledWith(42n, 7);
+  });
+
+  it("is idempotent: retrying an already-deleted post succeeds without a second write", async () => {
+    db.getPost.mockResolvedValueOnce(deletedPost);
+
+    const res = await request(app).delete("/api/posts/42");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: "42", deleted: false });
+    expect(db.markPostDeleted).not.toHaveBeenCalled();
+  });
+
+  it("404s for a post that never existed", async () => {
+    db.getPost.mockResolvedValueOnce(null);
+
+    const res = await request(app).delete("/api/posts/42");
+
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ code: "NOT_FOUND" });
+    expect(db.markPostDeleted).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes the two outcomes a client can observe", async () => {
+    db.getPost.mockResolvedValueOnce(deletedPost);
+    const already = await request(app).delete("/api/posts/42");
+
+    db.getPost.mockResolvedValueOnce(null);
+    const missing = await request(app).delete("/api/posts/42");
+
+    // Same status, different body — the client can tell "retry is pointless"
+    // from "retry is safe" without parsing prose.
+    expect(already.body.deleted).toBe(false);
+    expect(missing.body.code).toBe("NOT_FOUND");
+  });
+
+  it("rejects a malformed id before reading the post", async () => {
+    const res = await request(app).delete("/api/posts/abc");
+
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ code: "INVALID_ID" });
+    expect(db.getPost).not.toHaveBeenCalled();
   it("returns every documented key for a fully populated profile", async () => {
     db.getProfile.mockResolvedValueOnce({
       address: FOLLOW_ADDRESS,

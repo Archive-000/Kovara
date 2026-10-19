@@ -44,8 +44,21 @@ export function validatePostCreatedEvent(event: unknown): asserts event is PostC
 
 /**
  * Handle PostCreatedEvent
- * Inserts a new post row into the posts table
- * Idempotent: Uses ON CONFLICT DO NOTHING to handle duplicate events
+ * Inserts a new post row into the posts table.
+ *
+ * Replay safety (BE-02) rests on **event identity**: a post's id is assigned by
+ * the contract and is unique, so `(id)` is the identity of "this post was
+ * created". Re-applying the same event therefore has to converge on the same
+ * state as applying it once, which `ON CONFLICT (id) DO NOTHING` gives us
+ * atomically — the uniqueness check and the insert are one statement, so a
+ * redelivery racing the original cannot produce two rows.
+ *
+ * What `DO NOTHING` deliberately does *not* do is rewrite the row. A replay
+ * must never reset `tip_total` or `like_count` back to the values carried by the
+ * event (both `0` here): those counters have been moving forward with real tips
+ * and likes since the post was created, and an at-least-once redelivery would
+ * otherwise zero them. The conflict path is also silent about content, so a
+ * late-arriving content fetch cannot overwrite what was already stored.
  */
 export async function handlePostCreated(
   pool: Pool,
@@ -60,6 +73,7 @@ export async function handlePostCreated(
     INSERT INTO posts (id, author, content, tip_total, like_count, created_at)
     VALUES ($1, $2, $3, $4, $5, $6)
     ON CONFLICT (id) DO NOTHING
+    RETURNING id
   `;
 
   const values = [
@@ -74,6 +88,9 @@ export async function handlePostCreated(
   try {
     const result = await pool.query(query, values);
 
+    // `rowCount === 0` means the conflict path was taken: this exact post id was
+    // already stored, so the delivery was a replay and the existing row — with
+    // whatever engagement it has since accumulated — is left untouched.
     if (result.rowCount === 0) {
       logger.info(`Post ${id} already exists (idempotent skip)`);
     } else {
