@@ -40,7 +40,13 @@ import { Response } from "express";
 
 /** Machine-readable validation failure codes, shared by every endpoint. */
 export type ValidationCode =
-  "INVALID_ADDRESS" | "INVALID_QUERY" | "INVALID_ID" | "INVALID_CURSOR" | "LIMIT_EXCEEDED";
+  | "INVALID_ADDRESS"
+  | "INVALID_QUERY"
+  | "INVALID_ID"
+  | "INVALID_CURSOR"
+  | "INVALID_CONTENT"
+  | "INVALID_FIELD"
+  | "LIMIT_EXCEEDED";
 
 /**
  * A single validation failure.
@@ -202,6 +208,77 @@ export function parseCursor(raw: unknown, field = "cursor"): ValidationResult<st
     return fail("INVALID_CURSOR", `cursor cannot exceed ${MAX_CURSOR_LENGTH} characters`, field);
   }
   return { ok: true, value: raw };
+}
+
+// ── Free-text fields ─────────────────────────────────────────────────────────
+
+/**
+ * Longest post body the API accepts, in UTF-16 code units.
+ *
+ * The bound is applied at the API edge so an oversized body is refused before
+ * it reaches the database: `posts.content` is a plain `TEXT` column with no
+ * length constraint, so without this check an oversized post is stored happily
+ * and only fails later — when a client renders it, or when a list endpoint
+ * serializes it. The limit matches the 280-character cap the web client
+ * enforces, so a post the UI accepts is never rejected by the API (BE-04).
+ */
+export const MAX_POST_CONTENT_LENGTH = 280;
+
+/** Longest accepted profile username. Mirrors the on-chain profile limit. */
+export const MAX_USERNAME_LENGTH = 32;
+
+/**
+ * Parse post content submitted to the API.
+ *
+ * Unlike the other parsers this one measures the value *as submitted* rather
+ * than a trimmed copy, because content is stored verbatim: trimming here would
+ * silently rewrite a post. Only the emptiness and the length are checked, both
+ * before persistence.
+ */
+export function parsePostContent(
+  raw: unknown,
+  field = "content"
+): ValidationResult<string> {
+  if (typeof raw !== "string") {
+    return fail("INVALID_CONTENT", `${field} must be a string`, field);
+  }
+  if (raw.trim() === "") {
+    return fail("INVALID_CONTENT", `${field} cannot be empty`, field);
+  }
+  if (raw.length > MAX_POST_CONTENT_LENGTH) {
+    return fail(
+      "INVALID_CONTENT",
+      `${field} cannot exceed ${MAX_POST_CONTENT_LENGTH} characters (received ${raw.length})`,
+      field
+    );
+  }
+  return { ok: true, value: raw };
+}
+
+/**
+ * Parse a profile username.
+ *
+ * Length and emptiness are checked here rather than relying on the database
+ * constraints (`chk_profile_username_not_empty`, `uq_profile_username`), so a
+ * rejected username comes back as a field-specific 400 instead of a unique
+ * violation raised from inside a write (BE-06).
+ */
+export function parseUsername(raw: unknown, field = "username"): ValidationResult<string> {
+  if (typeof raw !== "string") {
+    return fail("INVALID_FIELD", `${field} must be a string`, field);
+  }
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return fail("INVALID_FIELD", `${field} cannot be empty`, field);
+  }
+  if (trimmed.length > MAX_USERNAME_LENGTH) {
+    return fail(
+      "INVALID_FIELD",
+      `${field} cannot exceed ${MAX_USERNAME_LENGTH} characters`,
+      field
+    );
+  }
+  return { ok: true, value: trimmed };
 }
 
 // ── Generic schema entry point ───────────────────────────────────────────────
