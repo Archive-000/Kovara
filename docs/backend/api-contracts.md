@@ -64,6 +64,10 @@ The result is a uniform contract:
 - Every validation failure returns **exactly** `{ "error": string, "code": string }`
   with status `400` — the same `ApiErrorResponse` envelope used by the rest of
   the API. No endpoint invents its own shape or code.
+- **Typed error details (BE-30).** Internally, every failure is represented as a
+  `ValidationIssue { status, code, error, field }`. The `field` property names the
+  request field that failed (never the submitted value) and is available for
+  structured server logging. The HTTP response body uses only `error` and `code`.
 - **Wallet addresses are security-sensitive.** An address must be a Stellar
   public key: `G` followed by 55 characters from the base-32 alphabet
   `A–Z`, `2–7`. The digits `0`, `1`, `8`, `9` are rejected (they never appear in
@@ -216,18 +220,47 @@ both and an idempotent retry would look like a failure.
 
 ### Search
 
-| Method | Path | Body |
+| Method | Path | Notes |
 | --- | --- | --- |
-| POST | `/api/v1/search/posts` | `{ "query": string, "limit"?: number, "offset"?: number }` |
+| POST | `/api/v1/search/posts` | Legacy post-only search. |
+| GET | `/api/v1/search?q=<term>&type=<entities>&limit=<n>&offset=<n>` | Ranked multi-entity search. |
+| GET | `/api/v1/search/facets?q=<term>` | Per-entity match counts. |
+| GET | `/api/v1/search/cache` | Operator view of the search response cache. |
 
-- `query` is required, trimmed, whitespace-collapsed, and capped at 500 characters.
-- `limit` default 20, max 100; `offset` default 0.
-- Response: `{ posts, total, has_more, next_offset, prev_offset }` where each post
-  is `{ id, author, content, tip_total, like_count, created_at, deleted }` and the
-  bigint fields are serialized as strings.
+#### Query validation (BE-26)
+
+- `q` is required, trimmed, and whitespace-collapsed before validation.
+- Empty or whitespace-only queries are rejected (`400 INVALID_QUERY`) before any
+  database call — an empty full-text query matches every row and would return the
+  full table.
+- Queries longer than **200 characters** (after normalization) are rejected with
+  `400 QUERY_TOO_LONG`.
+- Boundary: a 200-character query is accepted; a 201-character query is rejected.
+
+#### Whitespace normalization (detail)
+
+`normalizeQuery` trims and collapses internal runs of whitespace, so `" foo   bar "` and `"foo bar"` execute the same query and hit the same cache key. Normalization is applied before the length check, so trailing/leading whitespace cannot be used to push a query over the cap.
+
+#### Deterministic pagination (BE-27)
+
+Results are sorted by `score DESC, entity ASC, id ASC`. The trailing `entity` and `id` columns guarantee a total order, so adjacent pages with equal-ranked results do not overlap or skip rows. A client that pages through equal-scored results will see each hit exactly once.
+
+Pagination parameters:
+
+- `limit` default 20, max 100; a value above 100 is `400 LIMIT_EXCEEDED`.
+- `offset` default 0, max 10 000.
+
+Response:
+
+```json
+{ "hits": [ … ], "total": 0, "limit": 20, "offset": 0, "has_more": false, "normalized_query": "…" }
+```
+
+Each hit: `{ entity, id, title, snippet, score, attributes }`.
 
 Errors: `400 INVALID_QUERY`, `400 QUERY_TOO_LONG`, `400 LIMIT_EXCEEDED`,
-`500 SEARCH_UNAVAILABLE`.
+`400 INVALID_LIMIT`, `400 INVALID_OFFSET`, `400 OFFSET_EXCEEDED`,
+`400 INVALID_SEARCH_TYPE`, `500 SERIALIZATION_FAILED`.
 
 ### Follows
 
@@ -272,10 +305,32 @@ Mounted only when `EXPERIMENTAL_FEATURES === "true"`.
 | --- | --- | --- |
 | GET | `/api/v1/pools?limit=<n>&offset=<n>` | `limit` default 20, max 100. |
 | GET | `/api/v1/pools/:id` | Enriches the pool with token metadata. |
+| GET | `/api/v1/pools/:id/liquidity` | Liquidity view for one pool. |
+| GET | `/api/v1/pools/:id/membership/:address` | Membership check. |
+| GET | `/api/v1/pools/liquidity` | Whole-system liquidity summary. |
 
 Each pool is serialized with optional `token_name`, `token_symbol`,
 `token_decimals`; when metadata lookups fail the values fall back to
 `"unknown"`, `"UNK"`, `7`.
+
+#### Not-found contract (BE-25)
+
+All pool routes that accept a pool `:id` share one consistent not-found response:
+
+```json
+{ "error": "Pool not found", "code": "NOT_FOUND" }
+```
+
+with HTTP status `404`. The body contains **exactly** `error` and `code` — no
+extra keys. This applies uniformly to:
+
+- `GET /pools/:id`
+- `GET /pools/:id/liquidity`
+- `GET /pools/:id/membership/:address`
+
+A pool that exists but has a zero balance returns `200` from the liquidity
+endpoint with `active: false` — "no balance" is a valid state, not a missing
+pool. Only a pool that does not exist at all is a `404`.
 
 Errors: `400 INVALID_QUERY`, `400 LIMIT_EXCEEDED`,
 `400 INVALID_ID`, `404 NOT_FOUND`, `422 INVALID_THRESHOLD`.
@@ -369,12 +424,13 @@ returned. Use `X-Correlation-Id` to match a response to server-side diagnostics.
 | 400 | `MALFORMED_JSON` | `express.json()` syntax error |
 | 400 | `INVALID_QUERY` / `LIMIT_EXCEEDED` / `QUERY_TOO_LONG` | Route parameter validation |
 | 400 | `INVALID_ADDRESS` / `INVALID_ID` / `INVALID_CURSOR` | Route parameter validation (issue #665) |
+| 400 | `INVALID_LIMIT` / `INVALID_OFFSET` / `OFFSET_EXCEEDED` / `INVALID_SEARCH_TYPE` | Search parameter validation |
 | 401 | `UNAUTHORIZED` | Debug token mismatch |
 | 404 | `NOT_FOUND` | Route-level or 404 catch-all |
 | 422 | `INVALID_THRESHOLD` | Pool threshold validation |
 | 429 | `RATE_LIMIT_EXCEEDED` | Rate limiter |
 | 500 | `INTERNAL_ERROR` | Unhandled error |
-| 500 | `SEARCH_UNAVAILABLE` | Search backend missing |
+| 500 | `SERIALIZATION_FAILED` | Search response serialization failure |
 | 503 | `DATABASE_UNAVAILABLE` | Database error detected |
 | 503 | `REQUEST_TIMEOUT` | Request exceeded `REQUEST_TIMEOUT_MS` |
 | 503 | `DEBUG_DISABLED` | `DEBUG_TOKEN` not set |
