@@ -155,6 +155,34 @@ active request context exists; calls made without request context leave the body
 unchanged. The same ID is echoed in `X-Request-Id` and the legacy
 `X-Correlation-Id` response headers. Successful JSON responses are not modified.
 
+### Feed ordering and the tie policy (issue #922)
+
+Feed ranking (`Backend/src/feed/ranking.ts`) is pure and explainable: the same
+candidates and the same clock always produce the same order. Three modes answer
+different questions — `ranked` (weighted engagement + recency), `recent` (strict
+reverse-chronological) and `trending` (engagement *rate* over a bounded window).
+
+Every mode is given a **total order**, not just a score:
+
+- Scores are rounded to six decimal places *before* comparison, so two posts
+  that differ only below that precision are treated as tied rather than being
+  ordered by floating-point noise.
+- Ties are broken by **`id` descending** (`FEED_TIE_BREAK = "id_desc"`). Post ids
+  are unique and monotonic, so this is stable across requests and independent of
+  the order the rows came back from Postgres.
+- Entries with no usable score (`-Infinity` — `recent` mode with no timestamp,
+  trending outside the window) always sort after scored ones and are tied among
+  themselves by the same `id` rule.
+- Soft-deleted posts are dropped before ranking, not ranked last.
+
+Tied timestamps are the case this exists for. Two posts written in the same
+ledger second score identically, and without a trailing unique key Postgres is
+free to return those rows in any order — so a client paging with `offset` sees
+one row twice and never sees the other. The `id_desc` tie-break makes the order
+independent of arrival order, which is what "stable results" means here. The
+policy is echoed in every response as `ranking.tie_break`, so a client can see
+why two equal-scoring posts came back in the order they did.
+
 ### Reward rule precedence (issue #975)
 
 `assessSubmission` is a pure function: the same submission and verifications

@@ -10,12 +10,16 @@ import {
   DEFAULT_LIMIT,
   MAX_CURSOR_LENGTH,
   MAX_LIMIT,
+  MAX_POST_CONTENT_LENGTH,
+  MAX_USERNAME_LENGTH,
   parseCursor,
   parseLimit,
   parseNumericId,
   parseOffset,
   parseOptionalStellarAddress,
+  parsePostContent,
   parseStellarAddress,
+  parseUsername,
   sendValidationError,
   validate,
   isStellarAddress,
@@ -256,5 +260,74 @@ describe("validation / response helper", () => {
 
     expect(status).toHaveBeenCalledWith(400);
     expect(json).toHaveBeenCalledWith({ error: "address is required", code: "INVALID_ADDRESS" });
+  });
+});
+
+describe("validation / post content (BE-04)", () => {
+  it("accepts content at exactly the documented limit", () => {
+    const atLimit = "x".repeat(MAX_POST_CONTENT_LENGTH);
+    const parsed = parsePostContent(atLimit);
+    expect(parsed).toEqual({ ok: true, value: atLimit });
+  });
+
+  it("rejects content one character over the limit", () => {
+    const over = "x".repeat(MAX_POST_CONTENT_LENGTH + 1);
+    const parsed = parsePostContent(over);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.issue.code).toBe("INVALID_CONTENT");
+      expect(parsed.issue.field).toBe("content");
+      expect(parsed.issue.status).toBe(400);
+      expect(parsed.issue.error).toContain(String(MAX_POST_CONTENT_LENGTH));
+    }
+  });
+
+  it("counts the submitted value verbatim rather than a trimmed copy", () => {
+    // Content is stored as submitted, so the bound has to be measured on the
+    // raw value: trimming first would let padding through the limit.
+    const padded = `  ${"x".repeat(MAX_POST_CONTENT_LENGTH)}  `;
+    expect(parsePostContent(padded).ok).toBe(false);
+  });
+
+  it("rejects empty and whitespace-only content", () => {
+    for (const value of ["", "   ", "\n\t"]) {
+      const parsed = parsePostContent(value);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) expect(parsed.issue.code).toBe("INVALID_CONTENT");
+    }
+  });
+
+  it("rejects a non-string body", () => {
+    for (const value of [123, null, undefined, { text: "hi" }]) {
+      expect(parsePostContent(value).ok).toBe(false);
+    }
+  });
+});
+
+describe("validation / profile username (BE-06)", () => {
+  it("accepts a username at the limit and trims surrounding whitespace", () => {
+    const atLimit = "u".repeat(MAX_USERNAME_LENGTH);
+    expect(parseUsername(`  ${atLimit}  `)).toEqual({ ok: true, value: atLimit });
+  });
+
+  it("rejects a username over the limit with the field named", () => {
+    const parsed = parseUsername("u".repeat(MAX_USERNAME_LENGTH + 1));
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.issue.code).toBe("INVALID_FIELD");
+      expect(parsed.issue.field).toBe("username");
+    }
+  });
+
+  it("rejects an empty or whitespace-only username", () => {
+    for (const value of ["", "   "]) {
+      expect(parseUsername(value).ok).toBe(false);
+    }
+  });
+
+  it("reports the offending field when a custom field name is used", () => {
+    const parsed = parseUsername("", "display_name");
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.issue.field).toBe("display_name");
   });
 });

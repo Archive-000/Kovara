@@ -58,6 +58,74 @@ describe("rankFeed — recent mode (#676)", () => {
   });
 });
 
+/**
+ * Tied timestamps (BE-05).
+ *
+ * `recent` mode scores a post by its age, so two posts written in the same
+ * ledger second score identically. Without a total order the database is free
+ * to return those rows in any order, and a client paging with `offset` then
+ * sees one row twice and never sees the other. The `id_desc` tie-break makes
+ * the order independent of how the rows came back.
+ */
+describe("rankFeed — tied timestamps (BE-05)", () => {
+  const tied = [
+    post({ id: 7n, created_at: hoursAgo(3), like_count: 12n }),
+    post({ id: 3n, created_at: hoursAgo(3), like_count: 12n }),
+    post({ id: 11n, created_at: hoursAgo(3), like_count: 12n }),
+  ];
+
+  it("breaks a tied recent-mode timestamp by id descending", () => {
+    const result = rankFeed(tied, { mode: "recent", limit: 10, offset: 0, now: NOW });
+    expect(result.entries.map((e) => e.id)).toEqual(["11", "7", "3"]);
+  });
+
+  it("returns the same order whichever way the tied rows arrive", () => {
+    const orders = [
+      [tied[0], tied[1], tied[2]],
+      [tied[2], tied[1], tied[0]],
+      [tied[1], tied[2], tied[0]],
+    ];
+
+    for (const order of orders) {
+      const result = rankFeed(order, { mode: "recent", limit: 10, offset: 0, now: NOW });
+      expect(result.entries.map((e) => e.id)).toEqual(["11", "7", "3"]);
+    }
+  });
+
+  it("keeps the tie-break in ranked mode when scores match exactly", () => {
+    const result = rankFeed(tied, { mode: "ranked", limit: 10, offset: 0, now: NOW });
+    expect(result.entries.map((e) => e.id)).toEqual(["11", "7", "3"]);
+  });
+
+  it("does not repeat or skip a tied post across pages", () => {
+    const page1 = rankFeed(tied, { mode: "recent", limit: 2, offset: 0, now: NOW });
+    const page2 = rankFeed(tied, { mode: "recent", limit: 2, offset: 2, now: NOW });
+
+    const seen = [...page1.entries, ...page2.entries].map((e) => e.id);
+    expect(seen).toEqual(["11", "7", "3"]);
+    expect(new Set(seen).size).toBe(3);
+    expect(page1.has_more).toBe(true);
+    expect(page2.has_more).toBe(false);
+  });
+
+  it("sorts posts with no timestamp last, still tied by id descending", () => {
+    const result = rankFeed(
+      [
+        post({ id: 5n, created_at: null }),
+        post({ id: 9n, created_at: null }),
+        post({ id: 2n, created_at: hoursAgo(1) }),
+      ],
+      { mode: "recent", limit: 10, offset: 0, now: NOW }
+    );
+    expect(result.entries.map((e) => e.id)).toEqual(["2", "9", "5"]);
+  });
+
+  it("reports the tie policy in the echoed ruleset", () => {
+    const result = rankFeed(tied, { mode: "recent", limit: 10, offset: 0, now: NOW });
+    expect(result.ranking.tie_break).toBe("id_desc");
+  });
+});
+
 describe("rankFeed — ranked mode (#676)", () => {
   it("orders by the weighted engagement and recency score", () => {
     // Fresh and moderately engaged should beat old and heavily engaged.
