@@ -302,6 +302,30 @@ recently used. A bucket that is being used is moved to the most-recent end on
 every hit, so cleanup does not reset the limit of an active address; only idle
 addresses are evicted. The store is per-process and in memory.
 
+### Profile event replay safety (issue #924)
+
+`ProfileSet` states a desired **end state** — "this account's profile *is* this"
+— not a transition that may only happen once. The chain redelivers events after
+a crash, inside a replay window, or over an at-least-once transport, so applying
+N deliveries must leave exactly the profile that applying one would.
+
+`handleProfileSet` guarantees that with two rules:
+
+1. **Strictly-newer ledger only.** An event whose ledger is not greater than the
+   stored `updated_ledger` is ignored. That covers both halves of a replay: a
+   redelivery of the event already applied (`ledger ===`) and a replayed older
+   one (`ledger <`, the out-of-order case first raised in issue #927). The
+   newest *valid* state therefore always wins, and a duplicate can never
+   overwrite it — including a duplicate that carries a different username.
+2. **Canonical lookup key.** `event.user` is trimmed and folded to upper case
+   before the read *and* the write, so an event carrying `gabc…` resolves to the
+   row written as `GABC…` (issue #925). Without this a replayed event can miss
+   the existing row, take the "no profile yet" branch and open a second profile
+   for the same account.
+
+A `ProfileSet` with no stored profile is applied unconditionally — the first
+event is always the current state.
+
 ### Repeated-unfollow semantics (issue #931)
 
 An `Unfollow` event states a desired end state — "follower does not follow

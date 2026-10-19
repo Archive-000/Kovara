@@ -3,6 +3,8 @@ import { Database, Profile } from "../../db";
 import { ApiErrorResponse, ProfileResponse } from "../contracts";
 import {
   isStellarAddress,
+  parseStellarAddress,
+  sendValidationError,
   parseOptionalStellarAddress,
   parseStellarAddress,
   parseUsername,
@@ -21,6 +23,27 @@ export function isValidStellarAddress(addr: string): boolean {
   return isStellarAddress(addr);
 }
 
+/**
+ * Serialize a stored profile to its API shape (BE-09).
+ *
+ * The response always carries **every** documented key. A row that has never
+ * had a `creator_token`, or that predates a column being added, comes back from
+ * Postgres with those properties absent or `undefined`; passing that straight
+ * through `res.json` drops the keys entirely, so the same account serializes
+ * differently depending on which columns happen to be populated.
+ *
+ * Clients then have to treat a missing key and an explicit `null` as two
+ * different things — `profile.creator_token ?? fallback` works, but
+ * `'creator_token' in profile` and any generated OpenAPI type disagree with the
+ * documented shape. Normalizing absent/undefined to `null` here makes the
+ * contract stable: the keys are always present, and "not set" is always `null`.
+ */
+function serializeProfile(profile: Profile): ProfileResponse {
+  return {
+    address: profile.address,
+    username: profile.username ?? "",
+    creator_token: profile.creator_token ?? "",
+    updated_ledger: profile.updated_ledger ?? 0,
 /** The fields a profile update may set, and whether each one is required. */
 interface ProfileUpdateBody {
   username: string;
@@ -84,7 +107,7 @@ export function createProfilesRouter(db: Database): Router {
         return;
       }
 
-      res.json(profile);
+      res.json(serializeProfile(profile));
     }
   );
 

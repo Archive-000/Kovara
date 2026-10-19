@@ -17,15 +17,27 @@ import { RawEvent } from "./stream";
 // ── Stellar address normalization ────────────────────────────────────────────
 
 /** Valid Stellar public-key prefix (Ed25519). */
-const STELLAR_ADDR_PREFIX = /^G[A-Z2-7]{55}$/;
+const STELLAR_ADDR_PREFIX = /^G[A-Z2-7]{55}$/i;
 /** Stellar public keys are 56 base-32 characters. */
 const STELLAR_ADDR_LENGTH = 56;
 
-    // current.requestCount++;
 /**
- * Normalize a Stellar address string.
+ * Normalize a Stellar address string to its canonical form.
  *
- * Trims whitespace and validates the format (starts with `G`, 56 chars).
+ * Every caller gets the *same* string back for the same account. Three steps,
+ * in this order:
+ *
+ *  1. **Trim** surrounding whitespace — a paste artefact, not part of the key.
+ *  2. **Fold case to upper.** A Stellar strkey is base-32 over the alphabet
+ *     `A–Z` and `2–7`, so upper-case is the canonical encoding and lower-case
+ *     is the same key in a non-canonical form. Folding here means a profile
+ *     created from `gabc…` is found again by a lookup for `GABC…`, instead of
+ *     silently creating a second row. The pattern is matched case-insensitively
+ *     so the *character set* is still checked exactly: `0`, `1`, `8` and `9` do
+ *     not exist in strkeys and remain rejected.
+ *  3. **Validate** the folded value, so the length and alphabet errors a caller
+ *     sees describe the value that will actually be stored.
+ *
  * Throws if the address is structurally invalid after trimming.
  */
 export function normalizeAddress(addr: string): string {
@@ -38,10 +50,11 @@ export function normalizeAddress(addr: string): string {
       `normalizeAddress: expected ${STELLAR_ADDR_LENGTH} characters, got ${trimmed.length}`
     );
   }
-  if (!STELLAR_ADDR_PREFIX.test(trimmed)) {
+  const canonical = trimmed.toUpperCase();
+  if (!STELLAR_ADDR_PREFIX.test(canonical)) {
     throw new Error("normalizeAddress: expected a valid Stellar public key (G plus 55 base32 characters)");
   }
-  return trimmed;
+  return canonical;
 }
 
 // ── Amount normalization ─────────────────────────────────────────────────────

@@ -883,3 +883,85 @@ describe("API Routes", () => {
       });
       expect(db.getFollowingAfter).toHaveBeenCalledWith(FOLLOW_ADDRESS, cursor, 1);
     });
+
+/**
+ * Stable profile serialization (BE-09).
+ *
+ * The response always carries every documented key, so a client never has to
+ * distinguish "missing" from "explicitly null".
+ */
+describe("GET /profiles/:address — response shape (BE-09)", () => {
+  let db: jest.Mocked<Database>;
+  let app: ReturnType<typeof createApp>;
+
+  beforeEach(() => {
+    db = makeMockDb();
+    app = createApp(db);
+  });
+
+  it("returns every documented key for a fully populated profile", async () => {
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+      creator_token: OTHER_ADDRESS,
+      updated_ledger: 42,
+    });
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+  });
+
+  it("keeps the same keys when optional fields were never set", async () => {
+    // A row written before a column existed comes back from Postgres without it.
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+    } as never);
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+    expect(res.body.creator_token).toBe("");
+    expect(res.body.updated_ledger).toBe(0);
+  });
+
+  it("never drops a key that holds an explicit null", async () => {
+    db.getProfile.mockResolvedValueOnce({
+      address: FOLLOW_ADDRESS,
+      username: "alice",
+      creator_token: null,
+      updated_ledger: null,
+    } as never);
+
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body).sort()).toEqual([
+      "address",
+      "creator_token",
+      "updated_ledger",
+      "username",
+    ]);
+    expect(res.body.creator_token).toBe("");
+    expect(res.body.updated_ledger).toBe(0);
+  });
+
+  it("still 404s for a genuinely missing profile", async () => {
+    db.getProfile.mockResolvedValueOnce(null);
+    const res = await request(app).get(`/api/profiles/${FOLLOW_ADDRESS}`);
+    expect(res.status).toBe(404);
+  });
+});
