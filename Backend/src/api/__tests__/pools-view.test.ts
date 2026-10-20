@@ -37,6 +37,52 @@ function makeApp(pools: PoolRecord[]) {
   return app;
 }
 
+// ── BE-25: Clarify pool not-found responses ────────────────────────────────
+describe("pool not-found responses (BE-25)", () => {
+  it("GET /pools/:id returns 404 with code NOT_FOUND for an unknown pool", async () => {
+    const res = await request(makeApp([])).get("/pools/does-not-exist");
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: expect.any(String), code: "NOT_FOUND" });
+    expect(Object.keys(res.body).sort()).toEqual(["code", "error"]);
+  });
+
+  it("GET /pools/:id/liquidity returns 404 with code NOT_FOUND for an unknown pool", async () => {
+    const res = await request(makeApp([])).get("/pools/does-not-exist/liquidity");
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: expect.any(String), code: "NOT_FOUND" });
+    expect(Object.keys(res.body).sort()).toEqual(["code", "error"]);
+  });
+
+  it("GET /pools/:id/membership/:address returns 404 with code NOT_FOUND for an unknown pool", async () => {
+    const res = await request(makeApp([])).get(`/pools/does-not-exist/membership/${ADMIN}`);
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: expect.any(String), code: "NOT_FOUND" });
+    expect(Object.keys(res.body).sort()).toEqual(["code", "error"]);
+  });
+
+  it("all not-found responses share the same error shape across pool routes", async () => {
+    const app = makeApp([]);
+    const paths = [
+      "/pools/x",
+      "/pools/x/liquidity",
+      `/pools/x/membership/${ADMIN}`,
+    ];
+    for (const path of paths) {
+      const res = await request(app).get(path);
+      expect(res.status).toBe(404);
+      // Exactly {error, code} — no extra keys
+      expect(Object.keys(res.body).sort()).toEqual(["code", "error"]);
+      expect(res.body.code).toBe("NOT_FOUND");
+    }
+  });
+
+  it("returns 200 (not 404) when the pool exists", async () => {
+    const res = await request(makeApp([pool()])).get("/pools/pool-1");
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ pool_id: "pool-1" });
+  });
+});
+
 describe("pool membership and liquidity views (#677)", () => {
   it("returns a whole-system liquidity summary with accurate counts and balances", async () => {
     const app = makeApp([
